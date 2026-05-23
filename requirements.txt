@@ -1,0 +1,6 @@
+# CSV girisli Sportif Performans Testleri — Flask API bagimliliklari.
+# Pose cikarimi tarayicida (MediaPipe.js) yapildigi icin sunucuda
+# cv2/mediapipe/model GEREKMEZ.
+flask>=3.0
+gunicorn>=21          # Cloud Run / production WSGI
+numpy>=1.26,<2

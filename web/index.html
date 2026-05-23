@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pose CSV → Test Analizi</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         max-width: 760px; margin: 0 auto; padding: 24px 16px 64px;
+         line-height: 1.45; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; opacity: .7; font-size: .9rem; }
+  .card { border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+          border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  label { display: block; font-weight: 600; font-size: .85rem; margin: 10px 0 4px; }
+  select, input[type=number], input[type=text], textarea {
+    width: 100%; padding: 8px 10px; border-radius: 8px; font: inherit;
+    border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+    background: transparent; color: inherit; }
+  textarea { min-height: 56px; resize: vertical; font-family: ui-monospace, monospace; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 130px; }
+  .hint { font-size: .78rem; opacity: .65; margin-top: 4px; min-height: 1em; }
+  button { font: inherit; font-weight: 600; padding: 10px 16px; border-radius: 9px;
+           border: 0; cursor: pointer; background: #2563eb; color: #fff; }
+  button.secondary { background: color-mix(in srgb, currentColor 14%, transparent);
+                     color: inherit; }
+  button:disabled { opacity: .5; cursor: default; }
+  .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  progress { width: 100%; height: 10px; margin-top: 12px; }
+  #status { margin-top: 10px; font-size: .9rem; font-weight: 600; min-height: 1.2em; }
+  pre { background: color-mix(in srgb, currentColor 8%, transparent);
+        padding: 12px; border-radius: 10px; overflow: auto; font-size: .82rem;
+        white-space: pre-wrap; word-break: break-word; }
+  .err { color: #dc2626; }
+  video { display: none; }
+</style>
+</head>
+<body>
+  <h1>Pose CSV → Test Analizi</h1>
+  <p class="sub">Video tarayıcıda işlenir (MediaPipe Pose), pose noktaları CSV'ye
+     çıkarılıp Flask'a gönderilir. Video sunucuya yüklenmez.</p>
+
+  <div class="card">
+    <label for="test">Test</label>
+    <select id="test"></select>
+    <div class="hint" id="paramsHint"></div>
+
+    <div class="row">
+      <div>
+        <label for="height">height_m (boy, metre)</label>
+        <input id="height" type="number" step="0.01" placeholder="örn. 1.80" />
+      </div>
+      <div>
+        <label for="model">Model</label>
+        <select id="model">
+          <option value="lite">lite (hızlı)</option>
+          <option value="full" selected>full</option>
+          <option value="heavy">heavy (en doğru)</option>
+        </select>
+      </div>
+      <div>
+        <label for="conf">Algılama eşiği</label>
+        <input id="conf" type="number" step="0.05" min="0" max="1" value="0.3" />
+      </div>
+      <div>
+        <label for="fps">FPS (boş = otomatik)</label>
+        <input id="fps" type="number" step="0.01" placeholder="otomatik" />
+      </div>
+    </div>
+
+    <label for="params">Ek parametreler (satır başına <code>anahtar=değer</code>)</label>
+    <textarea id="params" placeholder="örn.&#10;duration=60&#10;joint=knee&#10;painful=false"></textarea>
+
+    <label for="file">Video dosyası</label>
+    <input id="file" type="file" accept="video/*" />
+
+    <div class="actions">
+      <button id="run">CSV çıkar &amp; gönder</button>
+      <button id="download" class="secondary" disabled>CSV indir</button>
+    </div>
+    <progress id="bar" value="0" max="1" hidden></progress>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <label>Sonuç</label>
+    <pre id="result">—</pre>
+  </div>
+
+  <video id="vid" muted playsinline></video>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const testSel = $("test"), heightEl = $("height"), modelEl = $("model"),
+      confEl = $("conf"), fpsEl = $("fps"), paramsEl = $("params"),
+      fileEl = $("file"), runBtn = $("run"), dlBtn = $("download"),
+      barEl = $("bar"), statusEl = $("status"), resultEl = $("result"),
+      hintEl = $("paramsHint"), vid = $("vid");
+
+const MPV = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.33";
+const MODEL_URLS = {
+  lite:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+  full:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+  heavy: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+};
+const N_PTS = 33;
+const PARAMS = {};          // test_id -> params[]
+let lastCsv = null;
+let _vision = null;         // FilesetResolver (cache'lenir)
+
+function setStatus(t, isErr = false) {
+  statusEl.textContent = t;
+  statusEl.className = isErr ? "err" : "";
+}
+
+// ── Test listesini /'dan al ───────────────────────────────────────────────
+async function loadTests() {
+  const j = await (await fetch("/")).json();
+  const cats = j.categories || {};
+  for (const cat of Object.keys(cats)) {
+    const og = document.createElement("optgroup");
+    og.label = cat;
+    let any = false;
+    for (const t of cats[cat]) {
+      if (t.input === "image_folder") continue;   // sebt: CSV modunda desteklenmez
+      PARAMS[t.id] = t.params || [];
+      const o = document.createElement("option");
+      o.value = t.id; o.textContent = t.id;
+      og.appendChild(o); any = true;
+    }
+    if (any) testSel.appendChild(og);
+  }
+  testSel.onchange = updateHint;
+  updateHint();
+}
+function updateHint() {
+  const p = PARAMS[testSel.value] || [];
+  hintEl.textContent = p.length ? "Parametreler: " + p.join(", ") : "";
+}
+
+// ── Video + FPS ───────────────────────────────────────────────────────────
+async function loadVideo(file) {
+  vid.src = URL.createObjectURL(file);
+  await new Promise((res, rej) => {
+    vid.onloadedmetadata = res;
+    vid.onerror = () => rej(new Error("Video yüklenemedi"));
+  });
+  return vid;
+}
+function measureFps(v) {
+  if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype))
+    return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const ts = []; let n = 0;
+    const done = () => {
+      v.pause();
+      if (ts.length < 3) return resolve(null);
+      const d = [];
+      for (let i = 1; i < ts.length; i++) d.push(ts[i] - ts[i - 1]);
+      d.sort((a, b) => a - b);
+      const med = d[Math.floor(d.length / 2)];
+      resolve(med > 0 ? 1 / med : null);
+    };
+    const cb = (_now, meta) => {
+      ts.push(meta.mediaTime); n++;
+      if (n < 16 && !v.ended) v.requestVideoFrameCallback(cb);
+      else done();
+    };
+    v.currentTime = 0;
+    v.play().then(() => v.requestVideoFrameCallback(cb)).catch(() => resolve(null));
+  });
+}
+function seek(v, t) {
+  return new Promise((res) => {
+    const h = () => { v.removeEventListener("seeked", h); res(); };
+    v.addEventListener("seeked", h);
+    v.currentTime = t;
+  });
+}
+
+// ── MediaPipe ─────────────────────────────────────────────────────────────
+async function makeLandmarker() {
+  const { PoseLandmarker, FilesetResolver } = await import(MPV);
+  if (!_vision) _vision = await FilesetResolver.forVisionTasks(MPV + "/wasm");
+  const conf = parseFloat(confEl.value) || 0.3;
+  const opts = {
+    baseOptions: { modelAssetPath: MODEL_URLS[modelEl.value], delegate: "GPU" },
+    runningMode: "VIDEO", numPoses: 1,
+    minPoseDetectionConfidence: conf,
+    minPosePresenceConfidence: conf,
+    minTrackingConfidence: conf,
+  };
+  try {
+    return await PoseLandmarker.createFromOptions(_vision, opts);
+  } catch (e) {
+    opts.baseOptions.delegate = "CPU";
+    return await PoseLandmarker.createFromOptions(_vision, opts);
+  }
+}
+
+// ── CSV ───────────────────────────────────────────────────────────────────
+function header() {
+  const c = ["frame", "time_s", "width", "height", "fps"];
+  for (let i = 0; i < N_PTS; i++) c.push(`x${i}`, `y${i}`, `z${i}`, `v${i}`);
+  for (let i = 0; i < N_PTS; i++) c.push(`wx${i}`, `wy${i}`, `wz${i}`);
+  return c.join(",");
+}
+function row(frame, t, W, H, fps, res) {
+  const meta = [frame, t.toFixed(5), W, H, fps.toFixed(5)];
+  const lm = res.landmarks && res.landmarks[0];
+  if (!lm) return meta.concat(Array(N_PTS * 4 + N_PTS * 3).fill("")).join(",");
+  const wm = res.worldLandmarks && res.worldLandmarks[0];
+  const out = meta.slice();
+  for (let i = 0; i < N_PTS; i++) {
+    const p = lm[i];
+    out.push(p.x.toFixed(8), p.y.toFixed(8), (p.z ?? 0).toFixed(8),
+             (p.visibility ?? 1).toFixed(6));
+  }
+  for (let i = 0; i < N_PTS; i++) {
+    const p = wm ? wm[i] : null;
+    if (p) out.push(p.x.toFixed(8), p.y.toFixed(8), p.z.toFixed(8));
+    else out.push("0", "0", "0");
+  }
+  return out.join(",");
+}
+
+async function extract(v, lmk, fps) {
+  const W = v.videoWidth, H = v.videoHeight, dur = v.duration;
+  const N = Math.max(1, Math.floor(dur * fps));
+  const lines = [header()];
+  barEl.hidden = false; barEl.max = N;
+  for (let i = 0; i < N; i++) {
+    const t = Math.min(i / fps, Math.max(0, dur - 1e-3));
+    await seek(v, t);
+    const res = lmk.detectForVideo(v, Math.round((i * 1000) / fps));
+    lines.push(row(i, i / fps, W, H, fps, res));
+    if (i % 4 === 0 || i === N - 1) {
+      barEl.value = i + 1;
+      setStatus(`Pose çıkarılıyor… ${i + 1}/${N}`);
+      await new Promise((r) => requestAnimationFrame(r));   // UI nefes alsın
+    }
+  }
+  return lines.join("\n");
+}
+
+// ── Gönderim ──────────────────────────────────────────────────────────────
+async function send(testId, csv) {
+  const fd = new FormData();
+  fd.append("csv", new Blob([csv], { type: "text/csv" }), "pose.csv");
+  const h = heightEl.value.trim();
+  if (h) fd.append("height_m", h);
+  for (const line of paramsEl.value.split("\n")) {
+    const s = line.trim();
+    const i = s.indexOf("=");
+    if (i > 0) fd.append(s.slice(0, i).trim(), s.slice(i + 1).trim());
+  }
+  const resp = await fetch(`/analyze/${testId}`, { method: "POST", body: fd });
+  let json;
+  try { json = await resp.json(); } catch { json = { error: await resp.text() }; }
+  resultEl.textContent = JSON.stringify(json, null, 2);
+  resultEl.classList.toggle("err", !resp.ok);
+  setStatus(resp.ok ? "Tamam ✓" : `Hata (${resp.status})`, !resp.ok);
+}
+
+// ── Akış ──────────────────────────────────────────────────────────────────
+async function run() {
+  const file = fileEl.files[0];
+  if (!file) { setStatus("Önce bir video seçin.", true); return; }
+  runBtn.disabled = true; dlBtn.disabled = true;
+  let lmk = null;
+  try {
+    setStatus("Model yükleniyor…");
+    lmk = await makeLandmarker();
+    setStatus("Video yükleniyor…");
+    const v = await loadVideo(file);
+    let fps = parseFloat(fpsEl.value);
+    if (!fps || fps <= 0) { setStatus("FPS ölçülüyor…"); fps = (await measureFps(v)) || 30; }
+    fpsEl.value = fps.toFixed(2);
+    lastCsv = await extract(v, lmk, fps);
+    dlBtn.disabled = false;
+    setStatus("CSV gönderiliyor…");
+    await send(testSel.value, lastCsv);
+  } catch (e) {
+    setStatus(e.message || String(e), true);
+    resultEl.textContent = String(e.stack || e);
+    resultEl.classList.add("err");
+  } finally {
+    if (lmk && lmk.close) lmk.close();
+    barEl.hidden = true; runBtn.disabled = false;
+  }
+}
+
+dlBtn.onclick = () => {
+  if (!lastCsv) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lastCsv], { type: "text/csv" }));
+  a.download = `${testSel.value}_pose.csv`;
+  a.click();
+};
+runBtn.onclick = run;
+loadTests().catch((e) => setStatus("Test listesi alınamadı: " + e.message, true));
+</script>
+</body>
+</html>

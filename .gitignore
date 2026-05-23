@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Pose CSV / medya (repoda tutulmaz)
+*.csv
+*.mp4
+*.mov
+*.MOV
+*.MP4
+*.task
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -23,10 +23,14 @@ import sys
 import tempfile
 import traceback
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Callable
 
-from flask import Flask, Response, jsonify, request
+import jwt
+from flask import Flask, Response, g, jsonify, request
+from flask_cors import CORS
+from jwt import PyJWKClient
 from werkzeug.utils import secure_filename
 
 ROOT = Path(__file__).resolve().parent
@@ -216,9 +220,56 @@ _reg(Test("10mwt", _GAIT, _10mwt, params=("distance(=10)", "start_x(ops)", "fini
 _reg(Test("rom", _ROM, _rom, params=("joint(=knee: knee/hip/elbow/shoulder/ankle/trunk)", "side(=auto)")))
 
 
+# ── Supabase JWT dogrulamasi ─────────────────────────────────────────────
+# Frontend Supabase'den aldigi JWT'yi `Authorization: Bearer <token>` ile yollar.
+# Backend JWKS uzerinden public key'le dogrular — secret dagitmaya gerek yok.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_JWT_AUD = os.environ.get("SUPABASE_JWT_AUD", "authenticated")
+_jwks_client: PyJWKClient | None = None
+
+
+def _jwks() -> PyJWKClient:
+    """PyJWKClient kendi icinde key'leri cache'ler (default 5 dk)."""
+    global _jwks_client
+    if _jwks_client is None:
+        if not SUPABASE_URL:
+            raise RuntimeError("SUPABASE_URL env var tanimlanmamis")
+        _jwks_client = PyJWKClient(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")
+    return _jwks_client
+
+
+def require_auth(fn):
+    """Supabase JWT bekler; claims'i g.user'a koyar (g.user['sub'] = user_id)."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "missing bearer token"}), 401
+        token = auth[len("Bearer "):].strip()
+        try:
+            key = _jwks().get_signing_key_from_jwt(token).key
+            g.user = jwt.decode(
+                token, key,
+                algorithms=["RS256", "ES256"],
+                audience=SUPABASE_JWT_AUD,
+                issuer=f"{SUPABASE_URL}/auth/v1",
+            )
+        except Exception as e:
+            return jsonify({"error": f"invalid token: {type(e).__name__}: {e}"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
 # ── Flask ────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024  # 1 GB
+
+# CORS — frontend'in /analyze cagirabilmesi icin. ALLOWED_ORIGINS env var
+# virgulle ayrilmis liste (orn. "https://dash.fizyotr.com,https://app.fizyotr.com").
+# Tanimlanmazsa "*" (gelistirme); production'da set et.
+_origins_env = os.environ.get("ALLOWED_ORIGINS", "*").strip()
+_origins = "*" if _origins_env == "*" else [o.strip() for o in _origins_env.split(",") if o.strip()]
+CORS(app, origins=_origins, allow_headers=["Content-Type", "Authorization"])
 
 
 @app.get("/health")
@@ -251,6 +302,7 @@ def index():
 
 
 @app.post("/analyze/<test_id>")
+@require_auth
 def analyze(test_id):
     t = TESTS.get(test_id)
     if t is None:

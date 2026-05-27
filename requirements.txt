@@ -2,5 +2,7 @@
 # Pose cikarimi tarayicida (MediaPipe.js) yapildigi icin sunucuda
 # cv2/mediapipe/model GEREKMEZ.
 flask>=3.0
+flask-cors>=4         # CORS (frontend'den /analyze cagirisi icin)
+PyJWT[crypto]>=2.8    # Supabase JWT (RS256/ES256) dogrulamasi + JWKS
 gunicorn>=21          # Cloud Run / production WSGI
 numpy>=1.26,<2

@@ -27,6 +27,9 @@
            border: 0; cursor: pointer; background: #2563eb; color: #fff; }
   button.secondary { background: color-mix(in srgb, currentColor 14%, transparent);
                      color: inherit; }
+  button.tertiary { background: transparent; color: inherit; padding: 6px 12px;
+                    border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+                    font-weight: 500; font-size: .85rem; }
   button:disabled { opacity: .5; cursor: default; }
   .actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
   progress { width: 100%; height: 10px; margin-top: 12px; }
@@ -36,6 +39,26 @@
         white-space: pre-wrap; word-break: break-word; }
   .err { color: #dc2626; }
   video { display: none; }
+
+  /* Pixel marker UI */
+  .marker-ui { margin: 14px 0 4px; }
+  .marker-ui canvas {
+    display: block; max-width: 100%; height: auto;
+    border-radius: 8px; cursor: crosshair;
+    border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+    background: color-mix(in srgb, currentColor 6%, transparent);
+  }
+  .marker-status { font-size: .85rem; margin-top: 8px; font-weight: 600; }
+  .marker-list { font-size: .78rem; opacity: .9; margin-top: 4px;
+                 min-height: 1.2em; display: flex; flex-wrap: wrap; gap: 14px; }
+  .marker-list .item { display: inline-flex; align-items: center; gap: 4px; }
+  .marker-list .swatch { width: 10px; height: 10px; border-radius: 2px;
+                         display: inline-block; }
+  .marker-list .pending { opacity: .4; }
+  .marker-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .marker-frame-row { display: flex; gap: 10px; align-items: center;
+                      margin: 8px 0 6px; font-size: .8rem; opacity: .85; }
+  .marker-frame-row input[type=range] { flex: 1; }
 </style>
 </head>
 <body>
@@ -77,6 +100,22 @@
     <label for="file">Video dosyası</label>
     <input id="file" type="file" accept="video/*" />
 
+    <div id="markerUI" class="marker-ui" hidden>
+      <label>Çizgileri işaretle (videonun üstüne tıkla)</label>
+      <canvas id="markerCanvas"></canvas>
+      <div class="marker-frame-row">
+        <span>Önizleme:</span>
+        <input id="markerSeek" type="range" min="0" max="1" step="0.001" value="0" />
+        <span id="markerTime">0.0s</span>
+      </div>
+      <div class="marker-status" id="markerStatus"></div>
+      <div class="marker-list" id="markerList"></div>
+      <div class="marker-actions">
+        <button id="markerClear" class="tertiary" type="button">Sıfırla</button>
+        <button id="markerUndo"  class="tertiary" type="button">Geri al</button>
+      </div>
+    </div>
+
     <div class="actions">
       <button id="run">CSV çıkar &amp; gönder</button>
       <button id="download" class="secondary" disabled>CSV indir</button>
@@ -99,6 +138,11 @@ const testSel = $("test"), heightEl = $("height"), modelEl = $("model"),
       fileEl = $("file"), runBtn = $("run"), dlBtn = $("download"),
       barEl = $("bar"), statusEl = $("status"), resultEl = $("result"),
       hintEl = $("paramsHint"), vid = $("vid");
+// Pixel-marker UI elements
+const markerUI = $("markerUI"), markerCanvas = $("markerCanvas"),
+      markerStatus = $("markerStatus"), markerList = $("markerList"),
+      markerClear = $("markerClear"), markerUndo = $("markerUndo"),
+      markerSeek = $("markerSeek"), markerTime = $("markerTime");
 
 const MPV = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.33";
 const MODEL_URLS = {
@@ -108,8 +152,24 @@ const MODEL_URLS = {
 };
 const N_PTS = 33;
 const PARAMS = {};          // test_id -> params[]
+
+// Test başına pixel-marker isimleri (sıra: kullanıcı bu sırayla tıklar).
+// Buradaki isim = backend'in beklediği form parametresi.
+const MARKERS = {
+  "10mwt":      ["start_x", "finish_x"],
+  "30m":        ["start_x", "finish_x"],
+  "10-20-30m":  ["start_x", "split_x_10", "split_x_20", "finish_x"],
+  "5-15":       ["start_x", "split_x_5", "finish_x"],
+  "5-0-5":      ["left_x", "center_x", "right_x"],
+};
+// Marker görsel renkleri (sırayla).
+const MARKER_COLORS = ["#ef4444", "#f59e0b", "#10b981", "#3b82f6", "#a855f7"];
+
 let lastCsv = null;
 let _vision = null;         // FilesetResolver (cache'lenir)
+let markerValues = {};      // {name: pixel_x_in_video_coords}
+let markerCtx = null;
+let videoReadyForMarker = false;
 
 function setStatus(t, isErr = false) {
   statusEl.textContent = t;
@@ -133,21 +193,168 @@ async function loadTests() {
     }
     if (any) testSel.appendChild(og);
   }
-  testSel.onchange = updateHint;
-  updateHint();
+  testSel.onchange = onTestChange;
+  onTestChange();
 }
-function updateHint() {
+function onTestChange() {
   const p = PARAMS[testSel.value] || [];
   hintEl.textContent = p.length ? "Parametreler: " + p.join(", ") : "";
+  // Marker UI'ı bu test gerektiriyorsa göster.
+  markerValues = {};
+  if (MARKERS[testSel.value]) {
+    markerUI.hidden = false;
+    if (videoReadyForMarker) redrawMarkerCanvas();
+    updateMarkerStatus();
+  } else {
+    markerUI.hidden = true;
+  }
 }
+
+// ── Pixel-marker UI ──────────────────────────────────────────────────────
+function currentMarkers() { return MARKERS[testSel.value] || []; }
+function nextMarker() {
+  const names = currentMarkers();
+  return names.find((n) => !(n in markerValues)) || null;
+}
+function updateMarkerStatus() {
+  const names = currentMarkers();
+  const done = names.filter((n) => n in markerValues).length;
+  const nxt = nextMarker();
+  markerStatus.textContent = nxt
+    ? `Sıradaki: ${nxt}  (${done + 1}/${names.length})`
+    : `Tüm çizgiler işaretlendi ✓ (${names.length}/${names.length})`;
+  // Liste
+  markerList.innerHTML = "";
+  names.forEach((n, i) => {
+    const sp = document.createElement("span");
+    sp.className = "item" + ((n in markerValues) ? "" : " pending");
+    const sw = document.createElement("span");
+    sw.className = "swatch";
+    sw.style.background = MARKER_COLORS[i % MARKER_COLORS.length];
+    sp.appendChild(sw);
+    const tx = document.createElement("span");
+    tx.textContent = (n in markerValues)
+      ? `${n}=${markerValues[n]}`
+      : `${n}=?`;
+    sp.appendChild(tx);
+    markerList.appendChild(sp);
+  });
+}
+
+function fitCanvasToVideo() {
+  // Canvas çözünürlüğü = video gerçek piksel çözünürlüğü.
+  // Görüntü boyutu CSS ile max-width:100% kısıtlanır.
+  markerCanvas.width = vid.videoWidth || 1280;
+  markerCanvas.height = vid.videoHeight || 720;
+  markerCtx = markerCanvas.getContext("2d");
+}
+
+function drawMarkerLines() {
+  if (!markerCtx) return;
+  const names = currentMarkers();
+  names.forEach((n, i) => {
+    if (!(n in markerValues)) return;
+    const x = markerValues[n];
+    const c = MARKER_COLORS[i % MARKER_COLORS.length];
+    markerCtx.strokeStyle = c;
+    markerCtx.lineWidth = Math.max(2, markerCanvas.width / 500);
+    markerCtx.beginPath();
+    markerCtx.moveTo(x, 0);
+    markerCtx.lineTo(x, markerCanvas.height);
+    markerCtx.stroke();
+    // Etiket
+    markerCtx.fillStyle = c;
+    markerCtx.font = `${Math.max(14, markerCanvas.width / 60)}px system-ui, sans-serif`;
+    markerCtx.textBaseline = "top";
+    const pad = 4;
+    const txt = n;
+    const m = markerCtx.measureText(txt);
+    markerCtx.fillRect(x + 4, 4, m.width + pad * 2, parseInt(markerCtx.font) + pad * 2);
+    markerCtx.fillStyle = "#fff";
+    markerCtx.fillText(txt, x + 4 + pad, 4 + pad);
+  });
+}
+
+function redrawMarkerCanvas() {
+  if (!markerCtx || !videoReadyForMarker) return;
+  // Mevcut video frame'ini çiz, sonra çizgileri üstüne bindir.
+  markerCtx.drawImage(vid, 0, 0, markerCanvas.width, markerCanvas.height);
+  drawMarkerLines();
+}
+
+async function seek(v, t) {
+  return new Promise((res) => {
+    const h = () => { v.removeEventListener("seeked", h); res(); };
+    v.addEventListener("seeked", h);
+    v.currentTime = t;
+  });
+}
+
+async function initMarkerForVideo() {
+  // Video metadata yüklendikten sonra çağrılır.
+  fitCanvasToVideo();
+  // Ortadaki frame'i göster (sporcu genelde sahnede olur). Slider 0..1 oranı.
+  const dur = vid.duration || 0;
+  if (dur > 0) {
+    await seek(vid, dur * 0.5);
+    markerSeek.value = "0.5";
+    markerTime.textContent = (dur * 0.5).toFixed(2) + "s";
+  } else {
+    markerSeek.value = "0";
+    markerTime.textContent = "0.0s";
+  }
+  videoReadyForMarker = true;
+  if (!markerUI.hidden) redrawMarkerCanvas();
+}
+
+markerCanvas.addEventListener("click", (e) => {
+  const nxt = nextMarker();
+  if (!nxt) return;
+  const rect = markerCanvas.getBoundingClientRect();
+  // CSS → video pixel ölçekleme
+  const x = Math.round((e.clientX - rect.left) * markerCanvas.width / rect.width);
+  markerValues[nxt] = Math.max(0, Math.min(markerCanvas.width - 1, x));
+  updateMarkerStatus();
+  redrawMarkerCanvas();
+});
+
+markerClear.addEventListener("click", () => {
+  markerValues = {};
+  updateMarkerStatus();
+  redrawMarkerCanvas();
+});
+
+markerUndo.addEventListener("click", () => {
+  const names = currentMarkers();
+  // Son işaretleneni bul ve sil.
+  for (let i = names.length - 1; i >= 0; i--) {
+    if (names[i] in markerValues) {
+      delete markerValues[names[i]];
+      break;
+    }
+  }
+  updateMarkerStatus();
+  redrawMarkerCanvas();
+});
+
+markerSeek.addEventListener("input", async () => {
+  if (!videoReadyForMarker) return;
+  const dur = vid.duration || 0;
+  const t = Math.max(0, Math.min(dur - 1e-3, parseFloat(markerSeek.value) * dur));
+  await seek(vid, t);
+  markerTime.textContent = t.toFixed(2) + "s";
+  redrawMarkerCanvas();
+});
 
 // ── Video + FPS ───────────────────────────────────────────────────────────
 async function loadVideo(file) {
+  videoReadyForMarker = false;
   vid.src = URL.createObjectURL(file);
   await new Promise((res, rej) => {
     vid.onloadedmetadata = res;
     vid.onerror = () => rej(new Error("Video yüklenemedi"));
   });
+  await initMarkerForVideo();
   return vid;
 }
 function measureFps(v) {
@@ -173,13 +380,17 @@ function measureFps(v) {
     v.play().then(() => v.requestVideoFrameCallback(cb)).catch(() => resolve(null));
   });
 }
-function seek(v, t) {
-  return new Promise((res) => {
-    const h = () => { v.removeEventListener("seeked", h); res(); };
-    v.addEventListener("seeked", h);
-    v.currentTime = t;
-  });
-}
+
+// Video seçilince marker UI için ilk frame çiz.
+fileEl.addEventListener("change", async () => {
+  const file = fileEl.files[0];
+  if (!file) return;
+  try {
+    await loadVideo(file);
+  } catch (e) {
+    setStatus(e.message || String(e), true);
+  }
+});
 
 // ── MediaPipe ─────────────────────────────────────────────────────────────
 async function makeLandmarker() {
@@ -252,6 +463,11 @@ async function send(testId, csv) {
   fd.append("csv", new Blob([csv], { type: "text/csv" }), "pose.csv");
   const h = heightEl.value.trim();
   if (h) fd.append("height_m", h);
+  // Pixel marker'lar (varsa)
+  for (const [k, v] of Object.entries(markerValues)) {
+    fd.append(k, String(v));
+  }
+  // Ek parametreler (markerlardan sonra; gerekirse override eder)
   for (const line of paramsEl.value.split("\n")) {
     const s = line.trim();
     const i = s.indexOf("=");
@@ -269,17 +485,27 @@ async function send(testId, csv) {
 async function run() {
   const file = fileEl.files[0];
   if (!file) { setStatus("Önce bir video seçin.", true); return; }
+  // Pixel marker'lar zorunluysa eksik olmasın.
+  const reqMarkers = MARKERS[testSel.value];
+  if (reqMarkers) {
+    const missing = reqMarkers.filter((n) => !(n in markerValues));
+    if (missing.length) {
+      setStatus(`Eksik çizgi: ${missing.join(", ")} — videoda tıkla.`, true);
+      return;
+    }
+  }
   runBtn.disabled = true; dlBtn.disabled = true;
   let lmk = null;
   try {
     setStatus("Model yükleniyor…");
     lmk = await makeLandmarker();
     setStatus("Video yükleniyor…");
-    const v = await loadVideo(file);
+    // Video zaten fileEl.onchange ile yüklü; metadata garantilemek için tekrar bekle.
+    if (!vid.duration) await loadVideo(file);
     let fps = parseFloat(fpsEl.value);
-    if (!fps || fps <= 0) { setStatus("FPS ölçülüyor…"); fps = (await measureFps(v)) || 30; }
+    if (!fps || fps <= 0) { setStatus("FPS ölçülüyor…"); fps = (await measureFps(vid)) || 30; }
     fpsEl.value = fps.toFixed(2);
-    lastCsv = await extract(v, lmk, fps);
+    lastCsv = await extract(vid, lmk, fps);
     dlBtn.disabled = false;
     setStatus("CSV gönderiliyor…");
     await send(testSel.value, lastCsv);
@@ -290,6 +516,8 @@ async function run() {
   } finally {
     if (lmk && lmk.close) lmk.close();
     barEl.hidden = true; runBtn.disabled = false;
+    // Marker preview'ı tekrar göster (extract pose seek'leriyle değişmişti).
+    if (!markerUI.hidden && videoReadyForMarker) redrawMarkerCanvas();
   }
 }
 

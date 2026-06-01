@@ -359,6 +359,48 @@ def detect_flight_blocks(foot_ground_y, fps: float, *,
     return blocks, meta
 
 
+def motion_onset(xs, valid_start: int, *, rest_frames: int = 9,
+                 threshold_px: float = 50.0) -> Optional[float]:
+    """Rest pozisyonundan hareket baslangici karesi (alt-kare).
+
+    Initial rest pozisyonu = ilk `rest_frames` valid karenin medyani.
+    Onset = bu rest pozisyonundan |threshold_px| sapan ilk valid kare.
+    Sub-frame interpolasyonu: rest_x + threshold_px hedefini lineer bul.
+
+    Sporcu test basinda durur (cizgide bekler), sonra kosmaya baslar:
+    crossing_frame yetersizdir cunku rest pozisyonu zaten cizginin civari
+    olabilir; bu fonksiyon rest'ten net sapmayi yakalar.
+    """
+    xs = np.asarray(xs, dtype=float)
+    n = len(xs)
+    rest_vals: list[float] = []
+    for i in range(int(valid_start), n):
+        v = xs[i]
+        if np.isnan(v):
+            continue
+        rest_vals.append(float(v))
+        if len(rest_vals) >= rest_frames:
+            break
+    if len(rest_vals) < 3:
+        return None
+    rest_x = float(np.median(rest_vals))
+    prev_i = -1
+    prev_v = float("nan")
+    for i in range(int(valid_start), n):
+        v = xs[i]
+        if np.isnan(v):
+            continue
+        if abs(v - rest_x) > threshold_px:
+            if prev_i < 0 or np.isnan(prev_v) or v == prev_v:
+                return float(i)
+            target = rest_x + (threshold_px if v > rest_x else -threshold_px)
+            frac = (target - prev_v) / (v - prev_v)
+            frac = max(0.0, min(1.0, frac))
+            return float(prev_i + frac * (i - prev_i))
+        prev_i, prev_v = i, v
+    return None
+
+
 def crossing_frame(xs, target_x: float, direction: int,
                    start_idx: int = 0) -> Optional[float]:
     """xs[start_idx:] icinde target_x'i ilk asan alt-kare konumu (float).

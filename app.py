@@ -5,7 +5,7 @@ pose noktalarinin CSV'sini alir, ilgili analizcinin analyze() fonksiyonunu
 calistirir ve sonuc JSON doner. Sunucuda cv2/mediapipe/model GEREKMEZ
 (yalnizca flask + numpy).
 
-19 test (sebt haric) POST /analyze/<test_id> ile cagrilir.
+23 test (sebt haric) POST /analyze/<test_id> ile cagrilir.
 
 Calistirma:
     python app.py                      # http://localhost:8080  (arayuz: /app)
@@ -56,6 +56,7 @@ from src.tests import (  # noqa: E402
     jump_height, less as less_mod,
     bosco_60, rsi_10_5, flamingo,
     functional_reach, ten_m_walk, rom,
+    sprint_30m, sprint_10_20_30, sprint_5_15, shuttle_5_0_5,
 )
 
 
@@ -187,11 +188,56 @@ def _10mwt(v, c):
                               model=c.model())
 
 
+def _need_int(c: Ctx, name: str) -> int:
+    v = c.i(name)
+    if v is None:
+        raise ParamError(f"{name} gerekli (piksel x koordinati, tam sayi)")
+    return v
+
+
+def _sprint_30m(v, c):
+    return sprint_30m.analyze(v, distance_m=c.f("distance", 30.0),
+                              start_x=c.i("start_x"), finish_x=c.i("finish_x"),
+                              model=c.model())
+
+
+def _sprint_10_20_30(v, c):
+    return sprint_10_20_30.analyze(
+        v,
+        start_x=_need_int(c, "start_x"),
+        split_x_10=_need_int(c, "split_x_10"),
+        split_x_20=_need_int(c, "split_x_20"),
+        finish_x=_need_int(c, "finish_x"),
+        model=c.model(),
+    )
+
+
+def _sprint_5_15(v, c):
+    return sprint_5_15.analyze(
+        v,
+        start_x=_need_int(c, "start_x"),
+        split_x_5=_need_int(c, "split_x_5"),
+        finish_x=_need_int(c, "finish_x"),
+        model=c.model(),
+    )
+
+
+def _shuttle_5_0_5(v, c):
+    return shuttle_5_0_5.analyze(
+        v,
+        left_x=_need_int(c, "left_x"),
+        center_x=_need_int(c, "center_x"),
+        right_x=_need_int(c, "right_x"),
+        model=c.model(),
+    )
+
+
 # ── Kayitlar ─────────────────────────────────────────────────────────────
 _FMS = "FMS"
 _LOWER = "Sicrama/Alt-ekstremite"
 _BAL = "Denge/Fonksiyonel"
 _GAIT = "Yuruyus"
+_SPRINT = "Sprint/Suratlilik"
 _ROM = "ROM"
 _H = "height_m*"
 
@@ -216,6 +262,15 @@ _reg(Test("flamingo", _BAL, _flamingo, params=("duration(=60)", "height_m(ops)")
 _reg(Test("functional-reach", _BAL, _frt, params=("height_m(ops)",)))
 
 _reg(Test("10mwt", _GAIT, _10mwt, params=("distance(=10)", "start_x(ops)", "finish_x(ops)")))
+
+_reg(Test("30m", _SPRINT, _sprint_30m,
+          params=("start_x(ops)", "finish_x(ops)", "distance(=30)")))
+_reg(Test("10-20-30m", _SPRINT, _sprint_10_20_30,
+          params=("start_x*", "split_x_10*", "split_x_20*", "finish_x*")))
+_reg(Test("5-15", _SPRINT, _sprint_5_15,
+          params=("start_x*", "split_x_5*", "finish_x*")))
+_reg(Test("5-0-5", _SPRINT, _shuttle_5_0_5,
+          params=("left_x*", "center_x*", "right_x*")))
 
 _reg(Test("rom", _ROM, _rom, params=("joint(=knee: knee/hip/elbow/shoulder/ankle/trunk)", "side(=auto)")))
 

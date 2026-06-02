@@ -294,9 +294,17 @@ def _jwks() -> PyJWKClient:
 
 
 def require_auth(fn):
-    """Supabase JWT bekler; claims'i g.user'a koyar (g.user['sub'] = user_id)."""
+    """Supabase JWT bekler; claims'i g.user'a koyar (g.user['sub'] = user_id).
+
+    Lokal gelistirme icin AUTH_DISABLED=1 ile bypass edilebilir; bu durumda
+    g.user mock degerle doldurulur. Production deploy'da bu env var SET
+    EDILMEMELIDIR — varsayilan JWT dogrulamasi devrede kalir.
+    """
     @wraps(fn)
     def wrapper(*args, **kwargs):
+        if os.environ.get("AUTH_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+            g.user = {"sub": "local-dev", "role": "service"}
+            return fn(*args, **kwargs)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return jsonify({"error": "missing bearer token"}), 401

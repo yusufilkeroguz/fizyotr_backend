@@ -1,0 +1,11 @@
+# SOAPIE imaji (build context = soapie/). Runtime'da gerekmeyenler haric.
+.env
+*.env
+__pycache__/
+*.py[cod]
+tools/            # PDF->chunks DERLEMESI (pypdf) yalnizca offline; runtime'da gerekmez
+Dockerfile
+.dockerignore
+.gcloudignore
+README.md
+.DS_Store

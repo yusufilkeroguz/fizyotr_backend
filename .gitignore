@@ -1,3 +1,11 @@
+# Secrets — ASLA commit etme (.env her dizinde, orn. soapie/.env)
+.env
+*.env
+
+# Buyuk/deneysel artifaktlar — git'e girmez (deploy'da da haric)
+fugl-mayer/          # ~2.3 GB deneysel prototip (portu src/tests/fugl_meyer.py)
+videos/              # ham video/overlay ciktilari
+
 # Python
 __pycache__/
 *.py[cod]

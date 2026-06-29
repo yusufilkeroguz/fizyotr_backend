@@ -1,0 +1,7 @@
+# SOAPIE Cloud Build yuklemesi (gcloud run deploy --source soapie/).
+.env
+*.env
+__pycache__/
+*.py[cod]
+tools/
+.DS_Store

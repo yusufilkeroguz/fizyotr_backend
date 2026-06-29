@@ -1,0 +1,10 @@
+# SOAPIE servisi — BAGIMSIZ uygulama bagimliliklari (ana analiz servisinden ayri).
+# numpy / analizci bagimliliklari GEREKMEZ; bu servis yalnizca RAG + Claude.
+flask>=3.0
+flask-cors>=4         # CORS (frontend'den /soapie/suggest cagirisi icin)
+PyJWT[crypto]>=2.8    # Supabase JWT (RS256/ES256) dogrulamasi + JWKS
+gunicorn>=21          # Cloud Run / production WSGI
+anthropic>=0.69       # Claude API (SOAPIE S->O/A oneri uretimi)
+rank-bm25>=0.2.2      # lexical RAG retrieval (data/chunks.json, saf python)
+# Not: pypdf yalnizca indeks DERLEMESINDE gerekir (tools/build_index.py);
+# runtime'da gerekmez. data/chunks.json imaja dahildir.

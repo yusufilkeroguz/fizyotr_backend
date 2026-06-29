@@ -31,6 +31,56 @@ Bittiginde verdigi `https://fizyotr-backend-....run.app` adresine:
 - `GET /health`  → saglik kontrolu
 - `POST /analyze/<test_id>` → analiz
 
+---
+
+# SOAPIE agent — AYRI servis (`fizyotr-soapie`)
+
+SOAPIE oneri agent'i `fizyotr-backend`'ten **bagimsiz** ikinci bir Cloud Run
+servisidir (kendi WSGI/auth/Dockerfile/requirements'i `soapie/` altinda). Build
+context = `soapie/`. Claude API gerektirir; anahtar imaja GOMULMEZ, Secret
+Manager'da tutulur. `soapie/.env` deploy EDILMEZ (yalnizca lokal gelistirme).
+
+## 1) Tek seferlik — ANTHROPIC_API_KEY secret'i
+
+```bash
+gcloud services enable secretmanager.googleapis.com
+
+# Anahtari secret olarak olustur (soapie/.env'deki degerden okur)
+grep '^ANTHROPIC_API_KEY' soapie/.env | cut -d= -f2- | tr -d '"' | \
+  gcloud secrets create anthropic-api-key --data-file=- --replication-policy=automatic
+#   (anahtar degisirse yeni surum: ... | gcloud secrets versions add anthropic-api-key --data-file=-)
+
+# Cloud Run runtime SA'ya secret okuma izni ver
+PROJ_NUM=$(gcloud projects describe $(gcloud config get-value project) --format='value(projectNumber)')
+gcloud secrets add-iam-policy-binding anthropic-api-key \
+  --member="serviceAccount:${PROJ_NUM}-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+## 2) Deploy (ayri servis, `--source soapie/`)
+
+```bash
+gcloud run deploy fizyotr-soapie \
+  --source soapie/ \
+  --region europe-west1 \
+  --allow-unauthenticated \
+  --min-instances 0 --max-instances 4 \
+  --cpu 1 --memory 1Gi --concurrency 8 --timeout 300 \
+  --set-env-vars SUPABASE_URL=https://<proje>.supabase.co \
+  --update-secrets ANTHROPIC_API_KEY=anthropic-api-key:latest
+```
+
+Endpoint'ler (kendi `https://fizyotr-soapie-....run.app` adresinde):
+- `GET /health`            → servis + indeks durumu
+- `GET /soapie`            → indeks meta (auth'suz)
+- `POST /soapie/suggest`   → SOAP onerisi (auth'lu)
+
+> **Not:** SOAPIE (Opus + thinking) yaniti ~45 sn surebilir → `--timeout 300`.
+> RAG indeksi (`soapie/data/chunks.json`, ~1 MB) imaja dahil; kaynak PDF bu
+> context'te yok. `SUPABASE_URL` auth icin gerekir (ana servisle ayni proje).
+> Deploy sonrasi `GET /health` ile `ready:true` dogrula. Kod degisince ayni
+> komutu tekrar calistir — yeni revizyon olusur.
+
 ## Ayarlarin anlami
 
 | Bayrak | Aciklama |

@@ -18,7 +18,8 @@ from .schema import QueryTerms, SoapieSuggestion
 
 MODEL = "claude-opus-4-8"
 
-# Cikti her zaman taslaktir — sabit, modele uretttirilmez.
+# Yedek disclaimer (Turkce) — model uretmezse kullanilir. Normalde model,
+# oykunun diliyle ayni dilde bir disclaimer uretir (bkz. SYNTH_SYSTEM + schema).
 DISCLAIMER = (
     "Bu cikti yapay zeka tarafindan uretilmis bir TASLAKTIR; tani koymaz ve "
     "klinik karar yerine gecmez. Tum oneriler fizyoterapist tarafindan gozden "
@@ -120,9 +121,12 @@ def suggest(subjective: str, patient: Optional[dict] = None, k: int = 8) -> dict
         )
     suggestion = synthesize(subjective, chunks, patient)
 
+    data = suggestion.model_dump()
+    # disclaimer'i ust seviyeye tasi; model bos birakirsa Turkce yedege dus.
+    disclaimer = (data.pop("disclaimer", "") or "").strip() or DISCLAIMER
     return {
-        "soapie": suggestion.model_dump(),
-        "disclaimer": DISCLAIMER,
+        "soapie": data,
+        "disclaimer": disclaimer,                             # oyku diliyle ayni dil
         "query_terms": qt.model_dump(),                       # seffaflik / debug
         "retrieved_pages": sorted({c["page"] for c in chunks}),
         "source": retrieval.get_index().meta.get("source"),

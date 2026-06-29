@@ -50,3 +50,4 @@ class SoapieSuggestion(BaseModel):
     assessment: Assessment
     plan: Plan
     citations: List[int] = Field(description="Onerilerin dayandirildigi kaynak PDF sayfa numaralari.")
+    disclaimer: str = Field(description="Hastanin oyku diliyle ayni dilde uyari: taslak, tani koymaz, terapist onayi gerekir, tedavi icin harici kaynak sart.")

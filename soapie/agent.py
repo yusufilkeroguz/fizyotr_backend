@@ -16,7 +16,11 @@ from typing import Optional
 from . import prompts, retrieval
 from .schema import QueryTerms, SoapieSuggestion
 
-MODEL = "claude-opus-4-8"
+# Hiz/kalite/maliyet dengesi:
+#  - Sorgu cikarimi basit bir ceviri/cikarim isi -> Haiku (en hizli).
+#  - Sentez getirilen metni yapilandirir -> Sonnet 4.6 (Opus'a yakin, ~2-3x hizli).
+QUERY_MODEL = "claude-haiku-4-5"
+SYNTH_MODEL = "claude-sonnet-4-6"
 
 # Yedek disclaimer (Turkce) — model uretmezse kullanilir. Normalde model,
 # oykunun diliyle ayni dilde bir disclaimer uretir (bkz. SYNTH_SYSTEM + schema).
@@ -60,11 +64,10 @@ def extract_query(subjective: str, patient: Optional[dict] = None) -> QueryTerms
     user = subjective.strip()
     if patient:
         user += f"\n\n[Hasta bilgisi]: {patient}"
-    # Basit cikarim gorevi -> thinking kapali (dusuk gecikme).
+    # Basit cikarim gorevi -> Haiku, thinking yok (dusuk gecikme).
     resp = client.messages.parse(
-        model=MODEL,
-        max_tokens=2000,
-        thinking={"type": "disabled"},
+        model=QUERY_MODEL,
+        max_tokens=1500,
         system=prompts.QUERY_SYSTEM,
         messages=[{"role": "user", "content": user}],
         output_format=QueryTerms,
@@ -79,12 +82,9 @@ def _context_block(chunks: list[dict]) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
-def synthesize(subjective: str, chunks: list[dict], patient: Optional[dict] = None) -> SoapieSuggestion:
-    client = _client()
+def _synth_user(subjective: str, chunks: list[dict], patient: Optional[dict]) -> str:
     context = _context_block(chunks)
-    user = (
-        f"# Hastanin subjektif oykusu (terapist girdisi)\n{subjective.strip()}\n"
-    )
+    user = f"# Hastanin subjektif oykusu (terapist girdisi)\n{subjective.strip()}\n"
     if patient:
         user += f"\n# Hasta bilgisi\n{patient}\n"
     user += (
@@ -92,25 +92,32 @@ def synthesize(subjective: str, chunks: list[dict], patient: Optional[dict] = No
         "\nYukaridaki kaynak bolumlere ve subjektif oykuye dayanarak SOAP "
         "onerini uret. Kaynakta olmayan bilgiyi uydurma."
     )
-    # Klinik akil yurutme gerektirir -> adaptive thinking, ama effort=medium
-    # ile gecikme/maliyet dengelenir (kalite korunarak).
+    return user
+
+
+def synthesize(subjective: str, chunks: list[dict], patient: Optional[dict] = None) -> SoapieSuggestion:
+    client = _client()
+    # Sonnet 4.6 + adaptive thinking + effort=low: hizli, bu gorevde kalite yeterli.
+    # Cikti prompt'ta sinirli (madde sayilari) -> daha az token -> daha hizli.
     resp = client.messages.parse(
-        model=MODEL,
-        max_tokens=16000,
+        model=SYNTH_MODEL,
+        max_tokens=8000,
         thinking={"type": "adaptive"},
-        output_config={"effort": "medium"},
+        output_config={"effort": "low"},
         system=prompts.SYNTH_SYSTEM,
-        messages=[{"role": "user", "content": user}],
+        messages=[{"role": "user", "content": _synth_user(subjective, chunks, patient)}],
         output_format=SoapieSuggestion,
     )
     return resp.parsed_output
 
 
-def suggest(subjective: str, patient: Optional[dict] = None, k: int = 8) -> dict:
-    """Ucu birlestiren ana giris noktasi. Donen dict dogrudan JSON'lanabilir."""
+def prepare(subjective: str, patient: Optional[dict] = None, k: int = 8) -> tuple[QueryTerms, list[dict]]:
+    """Sentezden ONCEKI senkron asama: dogrulama + sorgu cikarimi + retrieval.
+
+    HTTP hata kodlari (400/422) icin streaming baslamadan once cagrilir.
+    """
     if not subjective or not subjective.strip():
         raise SoapieError("'subjective' (terapistin girdigi subjektif oyku) zorunludur.", status=400)
-
     qt = extract_query(subjective, patient)
     chunks = retrieval.search(_query_text(qt), k=k)
     if not chunks:
@@ -119,10 +126,10 @@ def suggest(subjective: str, patient: Optional[dict] = None, k: int = 8) -> dict
             "detaylandirin (bolge/semptom).",
             status=422,
         )
-    suggestion = synthesize(subjective, chunks, patient)
+    return qt, chunks
 
-    data = suggestion.model_dump()
-    # disclaimer'i ust seviyeye tasi; model bos birakirsa Turkce yedege dus.
+
+def _finalize(data: dict, qt: QueryTerms, chunks: list[dict]) -> dict:
     disclaimer = (data.pop("disclaimer", "") or "").strip() or DISCLAIMER
     return {
         "soapie": data,
@@ -131,3 +138,46 @@ def suggest(subjective: str, patient: Optional[dict] = None, k: int = 8) -> dict
         "retrieved_pages": sorted({c["page"] for c in chunks}),
         "source": retrieval.get_index().meta.get("source"),
     }
+
+
+def suggest(subjective: str, patient: Optional[dict] = None, k: int = 8) -> dict:
+    """Tek-parca (non-streaming) giris noktasi. Donen dict dogrudan JSON'lanabilir."""
+    qt, chunks = prepare(subjective, patient, k)
+    return _finalize(synthesize(subjective, chunks, patient).model_dump(), qt, chunks)
+
+
+def stream_synthesis(subjective: str, chunks: list[dict], qt: QueryTerms,
+                     patient: Optional[dict] = None):
+    """Sentezi parca parca akitir (SSE icin generator).
+
+    Yield edilen dict'ler:
+      {"type":"delta","text": "..."}     model metni aktikça
+      {"type":"result", ...}             tam, dogrulanmis sonuc (suggest() ile ayni sekil)
+      {"type":"error","error": "..."}    uretim/parse hatasi
+    Not: streaming yolunda structured-output yerine prompt-ile-JSON kullanilir;
+    sonunda json.loads + pydantic (SoapieSuggestion) ile dogrulanir.
+    """
+    import json
+    client = _client()
+    user = _synth_user(subjective, chunks, patient) + "\n\n" + prompts.JSON_INSTRUCTION
+    parts: list[str] = []
+    try:
+        with client.messages.stream(
+            model=SYNTH_MODEL,
+            max_tokens=8000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "low"},
+            system=prompts.SYNTH_SYSTEM,
+            messages=[{"role": "user", "content": user}],
+        ) as stream:
+            for text in stream.text_stream:
+                parts.append(text)
+                yield {"type": "delta", "text": text}
+        raw = "".join(parts).strip()
+        if raw.startswith("```"):                      # olasi kod-bloğu sarmalini ayikla
+            raw = raw.strip("`")
+            raw = raw[raw.find("{"): raw.rfind("}") + 1]
+        sug = SoapieSuggestion(**json.loads(raw))       # dogrula
+        yield {"type": "result", **_finalize(sug.model_dump(), qt, chunks)}
+    except Exception as e:
+        yield {"type": "error", "error": f"{type(e).__name__}: {e}"}

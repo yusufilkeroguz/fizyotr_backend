@@ -38,4 +38,30 @@ KURALLAR:
 - Bu cikti bir TASLAKTIR; tani koymaz, kesin hukum vermez. Dili oneri kipinde tut
   ("...degerlendirilebilir", "...onerilir", "...dusunulebilir").
 - Subjektif sorularda, oykudeki bosluklari kapatacak (Box 2.1 tarzi tipik
-  muayene sorulari) somut sorular oner."""
+  muayene sorulari) somut sorular oner.
+- KISA VE OZ OL (hiz icin): subjective_followup_questions en fazla 5;
+  her objective_exam alt-kategorisi en fazla 4 madde; possible_conditions en
+  fazla 4; paradigm_clues en fazla 4; recommended_tests en fazla 5.
+  clinical_reasoning en fazla 2-3 cumle; treatment_note 1-2 cumle. Her madde
+  tek, net bir cumle olsun; tekrar ve gereksiz aciklamadan kacin."""
+
+
+# Streaming yolunda (structured-output yerine) modele tam JSON sekli verilir;
+# parca parca akarken sonunda json.loads + pydantic ile dogrulanir.
+JSON_INSTRUCTION = """\
+Ciktiyi YALNIZCA su anahtarlara sahip TEK bir gecerli JSON nesnesi olarak dondur;
+oncesinde/sonrasinda hicbir metin, markdown veya kod bloğu ekleme:
+{
+  "subjective_followup_questions": [string],
+  "objective_exam": {
+    "observation": [string], "palpation": [string], "range_of_motion": [string],
+    "resistive_tests": [string], "special_and_neuro_tests": [string]
+  },
+  "assessment": {
+    "possible_conditions": [string], "clinical_reasoning": string,
+    "paradigm_clues": [string]
+  },
+  "plan": { "recommended_tests": [string], "treatment_note": string },
+  "citations": [number],
+  "disclaimer": string
+}"""

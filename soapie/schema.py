@@ -13,8 +13,9 @@ from pydantic import BaseModel, Field
 
 # ── Adim 1: Turkce subjective -> Ingilizce klinik sorgu terimleri ──────────
 class QueryTerms(BaseModel):
-    """Cross-lingual koprü: terapistin Turkce metninden BM25 icin EN terimler."""
+    """Cross-lingual koprü: terapistin metninden BM25 icin EN terimler + cikti dili."""
 
+    language: str = Field(description="Subjektif oykunun yazildigi dilin ADI, oyle ki ciktinin tamami bu dilde uretilecek (orn. 'Turkish', 'English', 'German').")
     region: str = Field(description="Etkilenen anatomik bolge, Ingilizce (orn. 'knee', 'cervical spine', 'shoulder').")
     english_keywords: List[str] = Field(description="PDF (Ingilizce muayene kitabi) icinde aranacak anahtar terimler.")
     suspected_structures: List[str] = Field(description="Suphelenilen yapilar, Ingilizce (orn. 'ACL', 'medial meniscus', 'supraspinatus').")

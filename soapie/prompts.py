@@ -10,7 +10,10 @@ Gorevin: Bu metinden, INGILIZCE bir muskuloskeletal muayene kitabinda arama
 yapmak icin kullanilacak Ingilizce klinik terimleri cikarmak. Cikti tamamen
 Ingilizce klinik terminoloji olmali (kaynak Ingilizce). Metinde acikca
 gecmeyen tani UYDURMA; yalnizca metindeki bilgilerden makul cikarim yap.
-Bolgeyi (region) mutlaka belirle. Kirmizi bayrak yoksa bos liste don."""
+Bolgeyi (region) mutlaka belirle. Kirmizi bayrak yoksa bos liste don.
+Ayrica metnin yazildigi DILI tespit et ve 'language' alanina o dilin Ingilizce
+adini yaz (orn. 'Turkish', 'English', 'German') — sonraki asama tum ciktiyi bu
+dilde uretecek."""
 
 # Adim 3 — getirilen kaynak baglamina dayali SOAP onerisi uret.
 SYNTH_SYSTEM = """\

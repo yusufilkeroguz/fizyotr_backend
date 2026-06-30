@@ -85,9 +85,16 @@ def _context_block(chunks: list[dict]) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
-def _synth_user(subjective: str, chunks: list[dict], patient: Optional[dict]) -> str:
+def _synth_user(subjective: str, chunks: list[dict], patient: Optional[dict],
+                language: Optional[str] = None) -> str:
     context = _context_block(chunks)
-    user = f"# Hastanin subjektif oykusu (terapist girdisi)\n{subjective.strip()}\n"
+    user = ""
+    if language:
+        # Net dil direktifi — talimat/kaynak dili ne olursa olsun cikti bu dilde.
+        user += (f"IMPORTANT — OUTPUT LANGUAGE: Write EVERY field value entirely in "
+                 f"{language}. Do not use any other language, regardless of the language "
+                 f"of these instructions or the source excerpts.\n\n")
+    user += f"# Hastanin subjektif oykusu (terapist girdisi)\n{subjective.strip()}\n"
     if patient:
         user += f"\n# Hasta bilgisi\n{patient}\n"
     user += (
@@ -98,7 +105,8 @@ def _synth_user(subjective: str, chunks: list[dict], patient: Optional[dict]) ->
     return user
 
 
-def synthesize(subjective: str, chunks: list[dict], patient: Optional[dict] = None) -> SoapieSuggestion:
+def synthesize(subjective: str, chunks: list[dict], patient: Optional[dict] = None,
+               language: Optional[str] = None) -> SoapieSuggestion:
     client = _client()
     # Sonnet 4.6 + adaptive thinking + effort=low: hizli, bu gorevde kalite yeterli.
     # Cikti prompt'ta sinirli (madde sayilari) -> daha az token -> daha hizli.
@@ -108,7 +116,7 @@ def synthesize(subjective: str, chunks: list[dict], patient: Optional[dict] = No
         thinking={"type": "adaptive"},
         output_config={"effort": "low"},
         system=prompts.SYNTH_SYSTEM,
-        messages=[{"role": "user", "content": _synth_user(subjective, chunks, patient)}],
+        messages=[{"role": "user", "content": _synth_user(subjective, chunks, patient, language)}],
         output_format=SoapieSuggestion,
     )
     return resp.parsed_output
@@ -146,7 +154,7 @@ def _finalize(data: dict, qt: QueryTerms, chunks: list[dict]) -> dict:
 def suggest(subjective: str, patient: Optional[dict] = None, k: int = 8) -> dict:
     """Tek-parca (non-streaming) giris noktasi. Donen dict dogrudan JSON'lanabilir."""
     qt, chunks = prepare(subjective, patient, k)
-    return _finalize(synthesize(subjective, chunks, patient).model_dump(), qt, chunks)
+    return _finalize(synthesize(subjective, chunks, patient, qt.language).model_dump(), qt, chunks)
 
 
 # SOAP'in 4 bolumu AYRI ve PARALEL uretilir; her biri kendi structured ciktisini
@@ -169,8 +177,8 @@ _SECTIONS = [
 ]
 
 
-def _section_call(client, key, model_cls, instruction, subjective, chunks, patient):
-    user = _synth_user(subjective, chunks, patient) + "\n\n" + instruction
+def _section_call(client, key, model_cls, instruction, subjective, chunks, patient, language):
+    user = _synth_user(subjective, chunks, patient, language) + "\n\n" + instruction
     resp = client.messages.parse(
         model=SYNTH_MODEL,
         max_tokens=3000,
@@ -203,7 +211,7 @@ def stream_synthesis(subjective: str, chunks: list[dict], qt: QueryTerms,
              "assessment": "assessment", "plan": "plan"}
 
     with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = [ex.submit(_section_call, client, k, m, ins, subjective, chunks, patient)
+        futs = [ex.submit(_section_call, client, k, m, ins, subjective, chunks, patient, qt.language)
                 for k, m, ins in _SECTIONS]
         for fut in as_completed(futs):
             try:

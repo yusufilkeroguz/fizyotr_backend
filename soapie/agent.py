@@ -14,6 +14,7 @@ import os
 from typing import Optional
 
 from . import prompts, retrieval
+from .labels import panel_labels
 from .schema import (
     QueryTerms, SoapieSuggestion,
     SubjectiveSection, ObjectiveSection, AssessmentSection, PlanSection,
@@ -144,6 +145,7 @@ def _finalize(data: dict, qt: QueryTerms, chunks: list[dict]) -> dict:
     disclaimer = (data.pop("disclaimer", "") or "").strip() or DISCLAIMER
     return {
         "soapie": data,
+        "labels": panel_labels(qt.language),                  # cikti dilinde panel basliklari
         "disclaimer": disclaimer,                             # oyku diliyle ayni dil
         "query_terms": qt.model_dump(),                       # seffaflik / debug
         "retrieved_pages": sorted({c["page"] for c in chunks}),
@@ -229,6 +231,7 @@ def stream_synthesis(subjective: str, chunks: list[dict], qt: QueryTerms,
     soapie["citations"] = sorted(cites) or sorted({c["page"] for c in chunks})
     yield {"type": "result",
            "soapie": soapie,
+           "labels": panel_labels(qt.language),
            "disclaimer": disclaimer or DISCLAIMER,
            "query_terms": qt.model_dump(),
            "retrieved_pages": sorted({c["page"] for c in chunks}),

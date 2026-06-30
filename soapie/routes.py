@@ -80,6 +80,7 @@ def register(app, auth):
         def gen():
             yield _sse({
                 "type": "meta",
+                "labels": agent.panel_labels(qt.language),   # paneller basliklarla erken cikar
                 "retrieved_pages": sorted({c["page"] for c in chunks}),
                 "query_terms": qt.model_dump(),
                 "source": retrieval.get_index().meta.get("source"),

@@ -51,3 +51,27 @@ class SoapieSuggestion(BaseModel):
     plan: Plan
     citations: List[int] = Field(description="Onerilerin dayandirildigi kaynak PDF sayfa numaralari.")
     disclaimer: str = Field(description="Hastanin oyku diliyle ayni dilde uyari: taslak, tani koymaz, terapist onayi gerekir, tedavi icin harici kaynak sart.")
+
+
+# ── Bolum-bazli (paralel/streaming) ciktilar ───────────────────────────────
+# Her bolum AYRI ve PARALEL uretilir; tamamlandiginda o panele hazir structured
+# veri akar (frontend beklemeden doldurur). Her biri kendi citations'ini tasir.
+class SubjectiveSection(BaseModel):
+    subjective_followup_questions: List[str]
+    disclaimer: str = Field(description="Oyku diliyle ayni dilde uyari (taslak/onay/harici tedavi kaynagi).")
+    citations: List[int]
+
+
+class ObjectiveSection(BaseModel):
+    objective_exam: ObjectiveExam
+    citations: List[int]
+
+
+class AssessmentSection(BaseModel):
+    assessment: Assessment
+    citations: List[int]
+
+
+class PlanSection(BaseModel):
+    plan: Plan
+    citations: List[int]

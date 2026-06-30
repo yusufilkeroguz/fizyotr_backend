@@ -14,7 +14,10 @@ import os
 from typing import Optional
 
 from . import prompts, retrieval
-from .schema import QueryTerms, SoapieSuggestion
+from .schema import (
+    QueryTerms, SoapieSuggestion,
+    SubjectiveSection, ObjectiveSection, AssessmentSection, PlanSection,
+)
 
 # Hiz/kalite/maliyet dengesi:
 #  - Sorgu cikarimi basit bir ceviri/cikarim isi -> Haiku (en hizli).
@@ -146,38 +149,79 @@ def suggest(subjective: str, patient: Optional[dict] = None, k: int = 8) -> dict
     return _finalize(synthesize(subjective, chunks, patient).model_dump(), qt, chunks)
 
 
+# SOAP'in 4 bolumu AYRI ve PARALEL uretilir; her biri kendi structured ciktisini
+# dondurur. (key, pydantic model, "sadece bu bolumu uret" talimati).
+_SECTIONS = [
+    ("subjective", SubjectiveSection,
+     "SADECE 'subjective_followup_questions' (en fazla 5 soru), 'disclaimer' "
+     "(oyku diliyle ayni dilde: taslak, tani koymaz, terapist onayi, tedavi icin "
+     "harici kaynak) ve 'citations' uret."),
+    ("objective", ObjectiveSection,
+     "SADECE 'objective_exam' (observation/palpation/range_of_motion/"
+     "resistive_tests/special_and_neuro_tests; her biri en fazla 4 madde) ve "
+     "'citations' uret."),
+    ("assessment", AssessmentSection,
+     "SADECE 'assessment' (possible_conditions en fazla 4, clinical_reasoning "
+     "2-3 cumle, paradigm_clues en fazla 4) ve 'citations' uret."),
+    ("plan", PlanSection,
+     "SADECE 'plan' (recommended_tests en fazla 5 + treatment_note: bu kaynak "
+     "tedaviyi kapsamaz, harici tedavi kaynagi gerekir) ve 'citations' uret."),
+]
+
+
+def _section_call(client, key, model_cls, instruction, subjective, chunks, patient):
+    user = _synth_user(subjective, chunks, patient) + "\n\n" + instruction
+    resp = client.messages.parse(
+        model=SYNTH_MODEL,
+        max_tokens=3000,
+        thinking={"type": "adaptive"},
+        output_config={"effort": "low"},
+        system=prompts.SYNTH_SYSTEM,
+        messages=[{"role": "user", "content": user}],
+        output_format=model_cls,
+    )
+    return key, resp.parsed_output.model_dump()
+
+
 def stream_synthesis(subjective: str, chunks: list[dict], qt: QueryTerms,
                      patient: Optional[dict] = None):
-    """Sentezi parca parca akitir (SSE icin generator).
+    """4 bolumu PARALEL uretir; her biri bitince o panele HAZIR structured veri akar.
 
     Yield edilen dict'ler:
-      {"type":"delta","text": "..."}     model metni aktikça
-      {"type":"result", ...}             tam, dogrulanmis sonuc (suggest() ile ayni sekil)
-      {"type":"error","error": "..."}    uretim/parse hatasi
-    Not: streaming yolunda structured-output yerine prompt-ile-JSON kullanilir;
-    sonunda json.loads + pydantic (SoapieSuggestion) ile dogrulanir.
+      {"type":"section","key":"subjective|objective|assessment|plan","data":{...}}
+      {"type":"result", ...}        tum bolumler birlesik (suggest() ile ayni sekil)
+      {"type":"error","error": "..."}
+    Bolumler bagimsiz oldugu icin A en sona kalmaz (~10-12s'de gelir), toplam
+    sure ~max(bolum) olur (sentezi seri uretmeye gore cok daha hizli).
     """
-    import json
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     client = _client()
-    user = _synth_user(subjective, chunks, patient) + "\n\n" + prompts.JSON_INSTRUCTION
-    parts: list[str] = []
-    try:
-        with client.messages.stream(
-            model=SYNTH_MODEL,
-            max_tokens=8000,
-            thinking={"type": "adaptive"},
-            output_config={"effort": "low"},
-            system=prompts.SYNTH_SYSTEM,
-            messages=[{"role": "user", "content": user}],
-        ) as stream:
-            for text in stream.text_stream:
-                parts.append(text)
-                yield {"type": "delta", "text": text}
-        raw = "".join(parts).strip()
-        if raw.startswith("```"):                      # olasi kod-bloğu sarmalini ayikla
-            raw = raw.strip("`")
-            raw = raw[raw.find("{"): raw.rfind("}") + 1]
-        sug = SoapieSuggestion(**json.loads(raw))       # dogrula
-        yield {"type": "result", **_finalize(sug.model_dump(), qt, chunks)}
-    except Exception as e:
-        yield {"type": "error", "error": f"{type(e).__name__}: {e}"}
+    soapie: dict = {}
+    disclaimer = ""
+    cites: set[int] = set()
+    field = {"subjective": "subjective_followup_questions", "objective": "objective_exam",
+             "assessment": "assessment", "plan": "plan"}
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [ex.submit(_section_call, client, k, m, ins, subjective, chunks, patient)
+                for k, m, ins in _SECTIONS]
+        for fut in as_completed(futs):
+            try:
+                key, data = fut.result()
+            except Exception as e:
+                yield {"type": "error", "error": f"{type(e).__name__}: {e}"}
+                continue
+            cites.update(data.pop("citations", []) or [])
+            if key == "subjective":
+                disclaimer = (data.pop("disclaimer", "") or "").strip()
+            f = field[key]
+            soapie[f] = data[f]
+            yield {"type": "section", "key": key, "data": {f: data[f]}}
+
+    soapie["citations"] = sorted(cites) or sorted({c["page"] for c in chunks})
+    yield {"type": "result",
+           "soapie": soapie,
+           "disclaimer": disclaimer or DISCLAIMER,
+           "query_terms": qt.model_dump(),
+           "retrieved_pages": sorted({c["page"] for c in chunks}),
+           "source": retrieval.get_index().meta.get("source")}

@@ -3,8 +3,10 @@
 *.env
 
 # Buyuk/deneysel artifaktlar — git'e girmez (deploy'da da haric)
-fugl-mayer/          # ~2.3 GB deneysel prototip (portu src/tests/fugl_meyer.py)
-videos/              # ham video/overlay ciktilari
+# ~2.3 GB deneysel prototip (portu src/tests/fugl_meyer.py)
+fugl-mayer/
+# ham video/overlay ciktilari
+videos/
 
 # Python
 __pycache__/

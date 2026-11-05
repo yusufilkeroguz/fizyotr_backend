@@ -34,6 +34,18 @@ LEFT_ANKLE, RIGHT_ANKLE = 27, 28
 LEFT_HEEL, RIGHT_HEEL = 29, 30
 LEFT_FOOT, RIGHT_FOOT = 31, 32  # foot_index
 
+# ── MediaPipe Hands 21-nokta landmark indisleri (el basina) ──────────────
+# iter_pose_hands() / iter_pose_hands_csv() ile saglanan sol/sag el listeleri
+# bu indislerle adreslenir. Fugl-Meyer onkol rotasyonu, bilek F/E ve FM-D
+# parmak-burun testleri bu noktalara ihtiyac duyar.
+HAND_WRIST = 0
+HAND_THUMB_CMC, HAND_THUMB_MCP, HAND_THUMB_IP, HAND_THUMB_TIP = 1, 2, 3, 4
+HAND_INDEX_MCP, HAND_INDEX_PIP, HAND_INDEX_DIP, HAND_INDEX_TIP = 5, 6, 7, 8
+HAND_MIDDLE_MCP, HAND_MIDDLE_PIP, HAND_MIDDLE_DIP, HAND_MIDDLE_TIP = 9, 10, 11, 12
+HAND_RING_MCP, HAND_RING_PIP, HAND_RING_DIP, HAND_RING_TIP = 13, 14, 15, 16
+HAND_PINKY_MCP, HAND_PINKY_PIP, HAND_PINKY_DIP, HAND_PINKY_TIP = 17, 18, 19, 20
+N_HAND_PTS = 21
+
 SKELETON_CONNECTIONS = [
     (LEFT_SHOULDER, RIGHT_SHOULDER),
     (LEFT_SHOULDER, LEFT_ELBOW), (LEFT_ELBOW, LEFT_WRIST),
@@ -201,6 +213,202 @@ def iter_pose_csv(csv_path: str) -> Iterator[tuple[int, float,
                 yield frame_idx, t, l2, l3, W, H, fps
             else:
                 yield frame_idx, t, None, None, W, H, fps
+
+
+# ── Pose + El (Fugl-Meyer icin) ──────────────────────────────────────────
+# Mevcut iter_pose 7'li demet uretir ve 25 testin tamami ona bagimlidir;
+# el landmark'lari icin AYRI bir API tutuyoruz (kirilma olmasin diye).
+# iter_pose_hands 9'lu demet uretir:
+#   (frame_idx, time_s, lm2d, lm3d, left_hand, right_hand, W, H, fps)
+# left_hand/right_hand: 21 elemanli _LM listesi (normalize x,y) veya None.
+
+def _find_task(name: str) -> str:
+    """Verilen .task model dosyasini cwd / models / ust dizinlerde arar."""
+    cands = [Path.cwd() / name, Path.cwd() / "models" / name]
+    for p in list(Path(__file__).resolve().parents)[:5]:
+        cands.append(p / name)
+        cands.append(p / "models" / name)
+    for c in cands:
+        if c.exists():
+            return str(c)
+    return name
+
+
+def _assign_hands_to_sides(hands_lm, lm2d):
+    """HandLandmarker el listelerini (her biri 21 normalize landmark) govde
+    tarafina (sol/sag) en yakin bilek mesafesine gore ata.
+
+    handedness etiketi ayna/selfie gorunumunde guvenilmez oldugu icin
+    el bilegi (landmark 0) ile pose LEFT_WRIST/RIGHT_WRIST arasindaki
+    normalize mesafe kullanilir. Her tarafa en yakin TEK el atanir.
+    Donus: (left_hand, right_hand) — her biri _LM listesi veya None.
+    """
+    if not hands_lm or lm2d is None:
+        return None, None
+    lw, rw = lm2d[LEFT_WRIST], lm2d[RIGHT_WRIST]
+    best = {"left": (None, 1e9), "right": (None, 1e9)}
+    for hand in hands_lm:
+        if not hand:
+            continue
+        h0 = hand[0]
+        dl = (h0.x - lw.x) ** 2 + (h0.y - lw.y) ** 2
+        dr = (h0.x - rw.x) ** 2 + (h0.y - rw.y) ** 2
+        side = "left" if dl <= dr else "right"
+        dist = min(dl, dr)
+        if dist < best[side][1]:
+            conv = [_LM(p.x, p.y, getattr(p, "z", 0.0), 1.0) for p in hand]
+            best[side] = (conv, dist)
+    return best["left"][0], best["right"][0]
+
+
+def iter_pose_hands(video_path: str, *, model: str = "heavy",
+                    conf: float = 0.3, hand_conf: float = 0.3,
+                    num_hands: int = 2) -> Iterator[tuple]:
+    """iter_pose gibi calisir ama ek olarak sol/sag 21-nokta el landmark'i
+    uretir. Yield: (frame, time_s, lm2d, lm3d, left_hand, right_hand, W, H, fps).
+
+    .csv girisinde iter_pose_hands_csv'e devreder (cv2/mediapipe gerekmez)."""
+    if str(video_path).lower().endswith(".csv"):
+        yield from iter_pose_hands_csv(video_path)
+        return
+
+    import cv2
+    from mediapipe import Image, ImageFormat
+    from mediapipe.tasks.python import BaseOptions
+    from mediapipe.tasks.python.vision import (
+        PoseLandmarker, PoseLandmarkerOptions,
+        HandLandmarker, HandLandmarkerOptions, RunningMode,
+    )
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video acilamadi: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    pose_opts = PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path(model)),
+        running_mode=RunningMode.VIDEO, num_poses=1,
+        min_pose_detection_confidence=conf,
+        min_pose_presence_confidence=conf,
+        min_tracking_confidence=conf,
+    )
+    hand_opts = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=_find_task("hand_landmarker.task")),
+        running_mode=RunningMode.VIDEO, num_hands=num_hands,
+        min_hand_detection_confidence=hand_conf,
+        min_hand_presence_confidence=hand_conf,
+        min_tracking_confidence=hand_conf,
+    )
+    try:
+        with PoseLandmarker.create_from_options(pose_opts) as pl, \
+             HandLandmarker.create_from_options(hand_opts) as hl:
+            fi = 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                ts = int(fi * 1000 / fps)
+                img = Image(image_format=ImageFormat.SRGB, data=rgb)
+                pr = pl.detect_for_video(img, ts)
+                hr = hl.detect_for_video(img, ts)
+                l2 = pr.pose_landmarks[0] if pr.pose_landmarks else None
+                l3 = pr.pose_world_landmarks[0] if pr.pose_world_landmarks else None
+                lh, rh = _assign_hands_to_sides(
+                    hr.hand_landmarks if hr and hr.hand_landmarks else None, l2)
+                yield fi, fi / fps, l2, l3, lh, rh, W, H, fps
+                fi += 1
+    finally:
+        cap.release()
+
+
+def iter_pose_hands_csv(csv_path: str) -> Iterator[tuple]:
+    """Pose+el CSV'sini iter_pose_hands ile ayni 9'lu demet olarak uretir.
+
+    Beklenen sutunlar (header zorunlu): iter_pose_csv'nin tum sutunlari +
+    opsiyonel el sutunlari:
+        lhx0..lhx20, lhy0..lhy20, lhv0..lhv20   (sol el, normalize)
+        rhx0..rhx20, rhy0..rhy20, rhv0..rhv20   (sag el, normalize)
+    El sutunlari yoksa veya hucre bossa ilgili el None doner.
+    """
+    with open(csv_path, newline="") as fh:
+        reader = _csv.reader(fh)
+        header = next(reader, None)
+        if not header:
+            return
+        col = {name.strip(): i for i, name in enumerate(header)}
+        has_world = "wx0" in col
+        has_lh = "lhx0" in col
+        has_rh = "rhx0" in col
+
+        def cell(row, name):
+            j = col.get(name)
+            if j is None or j >= len(row):
+                return ""
+            return row[j].strip()
+
+        def parse_hand(row, prefix):
+            pts = []
+            for i in range(N_HAND_PTS):
+                xs, ys = cell(row, f"{prefix}x{i}"), cell(row, f"{prefix}y{i}")
+                if xs == "" or ys == "":
+                    return None
+                vs = cell(row, f"{prefix}v{i}")
+                pts.append(_LM(float(xs), float(ys), 0.0,
+                               float(vs) if vs != "" else 1.0))
+            return pts
+
+        W, H, fps = 0, 0, 30.0
+        for k, row in enumerate(reader):
+            if not row:
+                continue
+
+            def fnum(name, default):
+                v = cell(row, name)
+                if v == "":
+                    return default
+                try:
+                    return float(v)
+                except ValueError:
+                    return default
+
+            W = int(fnum("width", W))
+            H = int(fnum("height", H))
+            fps = fnum("fps", fps) or 30.0
+            frame_idx = int(fnum("frame", k))
+            t = fnum("time_s", frame_idx / fps)
+
+            lh = parse_hand(row, "lh") if has_lh else None
+            rh = parse_hand(row, "rh") if has_rh else None
+
+            if cell(row, "x0") == "":          # bu karede pose yok
+                yield frame_idx, t, None, None, lh, rh, W, H, fps
+                continue
+
+            l2: list = []
+            l3: Optional[list] = [] if has_world else None
+            ok = True
+            for i in range(33):
+                xs, ys = cell(row, f"x{i}"), cell(row, f"y{i}")
+                if xs == "" or ys == "":
+                    ok = False
+                    break
+                zs, vs = cell(row, f"z{i}"), cell(row, f"v{i}")
+                vis = float(vs) if vs != "" else 1.0
+                l2.append(_LM(float(xs), float(ys),
+                              float(zs) if zs != "" else 0.0, vis))
+                if has_world:
+                    wx, wy, wz = (cell(row, f"wx{i}"), cell(row, f"wy{i}"),
+                                  cell(row, f"wz{i}"))
+                    l3.append(_LM(float(wx) if wx != "" else 0.0,
+                                  float(wy) if wy != "" else 0.0,
+                                  float(wz) if wz != "" else 0.0, vis))
+            if ok:
+                yield frame_idx, t, l2, l3, lh, rh, W, H, fps
+            else:
+                yield frame_idx, t, None, None, lh, rh, W, H, fps
 
 
 # ── Geometri ─────────────────────────────────────────────────────────────

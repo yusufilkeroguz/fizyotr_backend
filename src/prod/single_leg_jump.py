@@ -75,9 +75,20 @@ def analyze(video_path: str, height_m: float,
     ground_foot_y = float(np.median(foot_ground_arr[gidx]))
     ground_hip_y = float(np.median(hip_arr[gidx]))
 
-    takeoff_coarse = foot_ground_arr < (ground_foot_y - 30)
+    # Havada esigi: sabit 30px kucuk ziplamada (veya kucuk/uzak denekte) basarisiz
+    # olur — tipik cercevede 30px ~7-10cm'e denk gelir. Esigi vucut boyundan
+    # turetilen px_per_m ile GERCEK mesafeye (~2.5cm) baglariz; poz titremesine
+    # karsi alt taban 8px. (Ayagin yukselmesi = ziplama yuksekligine esit.)
+    body_ground = float(np.nanmedian(body_arr[gidx])) if gidx.size else np.nan
+    ppm_air = (body_ground / height_m) if (height_m and np.isfinite(body_ground)) else None
+    thr_air = max(8.0, 0.025 * ppm_air) if ppm_air else 15.0
+
+    takeoff_coarse = foot_ground_arr < (ground_foot_y - thr_air)
     if not takeoff_coarse.any():
-        raise RuntimeError("Havada kare bulunamadi.")
+        cm = f" (~{thr_air / ppm_air * 100:.1f}cm)" if ppm_air else ""
+        raise RuntimeError(
+            f"Ziplama algilanamadi: ayak yukselmesi olcum esiginin altinda{cm}. "
+            "Daha yuksek zipla, kamerayi yaklastir veya tum govde karede olsun.")
     idx = np.where(takeoff_coarse)[0]
     splits = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
     longest = max(splits, key=len)

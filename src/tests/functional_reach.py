@@ -33,57 +33,76 @@ def analyze(video_path: str, *, height_m: Optional[float] = None,
             debug_dir: Optional[str] = None) -> dict:
     wl_x, wl_y, wr_x, wr_y = [], [], [], []
     sh_x, sh_y, hip_x, nose_ank = [], [], [], []
+    ank_x = []
     wl_vis, wr_vis = [], []
     fps = 30.0
     for fi, t, l2, l3, W, H, fps in iter_pose(video_path, model=model, conf=conf):
         if l2 is None:
-            for L in (wl_x, wl_y, wr_x, wr_y, sh_x, sh_y, hip_x,
+            for L in (wl_x, wl_y, wr_x, wr_y, sh_x, sh_y, hip_x, ank_x,
                       nose_ank, wl_vis, wr_vis):
                 L.append(np.nan)
             continue
         lw, rw = pt2d(l2, LEFT_WRIST, W, H), pt2d(l2, RIGHT_WRIST, W, H)
         ls, rs = pt2d(l2, LEFT_SHOULDER, W, H), pt2d(l2, RIGHT_SHOULDER, W, H)
         lh, rh = pt2d(l2, LEFT_HIP, W, H), pt2d(l2, RIGHT_HIP, W, H)
+        la, ra = pt2d(l2, LEFT_ANKLE, W, H), pt2d(l2, RIGHT_ANKLE, W, H)
         wl_x.append(lw[0]); wl_y.append(lw[1]); wl_vis.append(l2[LEFT_WRIST].visibility)
         wr_x.append(rw[0]); wr_y.append(rw[1]); wr_vis.append(l2[RIGHT_WRIST].visibility)
         sh_x.append(float((ls[0] + rs[0]) / 2))
         sh_y.append(float((ls[1] + rs[1]) / 2))
         hip_x.append(float((lh[0] + rh[0]) / 2))
+        ank_x.append(float((la[0] + ra[0]) / 2))   # sabit referans (ayaklar planted)
         nose = pt2d(l2, NOSE, W, H)
-        ank_y = max(pt2d(l2, LEFT_ANKLE, W, H)[1], pt2d(l2, RIGHT_ANKLE, W, H)[1])
+        ank_y = max(la[1], ra[1])
         nose_ank.append(abs(ank_y - nose[1]))
 
-    # Uzanan kol: ortalama gorunurlugu yuksek olan bilek
-    arm = "left" if np.nanmean(wl_vis) >= np.nanmean(wr_vis) else "right"
-    wx = np.array(wl_x if arm == "left" else wr_x)
-    wy = np.array(wl_y if arm == "left" else wr_y)
     sx = np.array(sh_x)
     sy = np.array(sh_y)
+    body_h = np.nanpercentile(np.array(nose_ank), 90)
+    y_tol = 0.18 * body_h if np.isfinite(body_h) else 60.0
+
+    # Uzanan kol: omuz hizasinda (yatay kaldirilmis) en cok kalan bilek.
+    # Gorunurluk degil, cunku FRT'de iki kol da gorunur; ayirt eden, kolun
+    # gercekten omuz seviyesine kaldirilmis olmasidir.
+    def raised_count(wy_arr):
+        return int(np.nansum(np.abs(np.array(wy_arr) - sy) < y_tol))
+    nl, nr = raised_count(wl_y), raised_count(wr_y)
+    if max(nl, nr) >= 3:
+        arm = "left" if nl >= nr else "right"
+    else:  # ikisi de kaldirilmamis; gorunurluge geri don
+        arm = "left" if np.nanmean(wl_vis) >= np.nanmean(wr_vis) else "right"
+    wx = np.array(wl_x if arm == "left" else wr_x)
+    wy = np.array(wl_y if arm == "left" else wr_y)
     if np.isfinite(wx).sum() < 5:
         raise RuntimeError("Bilek takip edilemedi.")
 
     wxs = smooth_median(wx, 5)
     # Kol-yatay (kaldirilmis) kareler: bilek omuz hizasinda (|wy - sy| kucuk)
-    body_h = np.nanpercentile(np.array(nose_ank), 90)
-    y_tol = 0.18 * body_h if np.isfinite(body_h) else 60.0
     raised = np.abs(wy - sy) < y_tol
     raised &= ~np.isnan(wxs)
     if raised.sum() < 3:
         raise RuntimeError("Kol-yatay (kaldirilmis) faz tespit edilemedi.")
     raised_idx = np.where(raised)[0]
 
-    # Ileri yon: bilek omuza gore hangi tarafta uzaniyor
-    rel = wxs - sx
-    fwd = 1 if np.nanmedian(rel[raised_idx]) >= 0 else -1
-    ext = rel * fwd  # ileri uzanma (omuz referansli), buyuk = ileri
+    # Reach = bilegin YATAY yer degisimi, SABIT referansa (ayak bilegi) gore.
+    # Omuza gore degil: FRT'de kisi govdesini one egerek uzanir, bu sirada omuz
+    # da one gider; bilek-omuz farki neredeyse sabit kalip uzanmayi olcemez.
+    # Ayaklar planted oldugundan ayak bilegi x'i sabit referanstir; ona gore
+    # olcmek hem gercek uzanmayi yakalar hem olasi kamera kaymasini siler.
+    axs = smooth_median(np.array(ank_x), 5)
+    rel = wxs - axs
 
+    # Noter konum: kol kaldirilmis ama govde dik (uzanma faznin BASI). Ilk birkac
+    # raised karenin medyani. Reach = bunun uzerinden en buyuk YATAY sapma.
+    # Yonu ilk/son kareyi kiyaslayarak DEGIL (kisi sonda kolunu indirip noter'in
+    # gerisine gecebilir, bu yon tespitini ters cevirir), en buyuk |sapma| ile
+    # buluruz; boylece kamera yonunden (ileri = +x veya -x) bagimsiz.
+    base = float(np.nanmedian(rel[raised_idx[:5]]))
+    dev = rel - base
     start_frame = int(raised_idx[0])
-    start_ext = float(ext[start_frame])
-    # En ileri uzanma
-    ext_masked = np.where(raised, ext, np.nan)
-    peak_frame = int(np.nanargmax(ext_masked))
-    peak_ext = float(ext[peak_frame])
-    reach_px = peak_ext - start_ext
+    dev_masked = np.where(raised, np.abs(dev), np.nan)
+    peak_frame = int(np.nanargmax(dev_masked))
+    reach_px = float(abs(dev[peak_frame]))
 
     ppm = body_px_per_m(np.array(nose_ank), height_m) if height_m else None
     reach_cm = round(reach_px / ppm * 100, 1) if ppm else None

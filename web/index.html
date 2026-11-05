@@ -150,8 +150,32 @@ const MODEL_URLS = {
   full:  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
   heavy: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
 };
+// Fugl-Meyer onkol/bilek/FM-D skorlari icin 21-noktali el landmark'i.
+const HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 const N_PTS = 33;
+const N_HAND = 21;
 const PARAMS = {};          // test_id -> params[]
+
+// ── YOLO (sprint / çeviklik) ───────────────────────────────────────────────
+// Bu testler yalnızca gövdenin yatay konumunu (hip_x) kullanır → tam iskelet
+// gerekmez. Tarayıcı-içi YOLOv8n person-detection ile (ONNX Runtime Web, Web
+// Worker'da) çalışır; kutudan SENTETİK 33-landmark üretilip mevcut CSV şemasına
+// yazılır (backend HİÇ değişmez). Diğer testler MediaPipe pose yolunda kalır.
+const YOLO_TESTS = new Set(["30m", "10-20-30m", "5-15", "5-10-5", "5-0-5", "ada", "10mwt"]);
+function isYolo() { return YOLO_TESTS.has(testSel.value); }
+// yolov8n ONNX modeli STATİK ASSET. Backend statik servis vermediği (/app
+// yalnızca index.html döndürür) için HARİCİ bir URL'den yüklenir — kendi
+// host'unuza (Vercel Blob / Supabase Storage / herhangi CORS'lu CDN) yükleyip
+// aşağıdaki URL'i güncelleyin.
+//   Export:  yolo export model=yolov8n.pt format=onnx imgsz=416 simplify=True
+//   (int8 için ek nicemleme tercih; çıktı [1,84,A], girdi 1x3x416x416)
+const YOLO_MODEL_URL = "https://tkkgmylxdwhoerzkxnyc.supabase.co/storage/v1/object/public/models/yolov8n-416.onnx";
+const YOLO_IMGSZ = 416;
+// ONNX Runtime Web (WebGPU bundle: webgpu yoksa wasm'a düşer).
+const ORT_CDN = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+
+// El landmark'i hangi testlerde CSV'ye eklensin (fugl-* = Fugl-Meyer).
+function needsHands() { return testSel.value.startsWith("fugl"); }
 
 // Test başına pixel-marker isimleri (sıra: kullanıcı bu sırayla tıklar).
 // Buradaki isim = backend'in beklediği form parametresi.
@@ -160,7 +184,14 @@ const MARKERS = {
   "30m":        ["start_x", "finish_x"],
   "10-20-30m":  ["start_x", "split_x_10", "split_x_20", "finish_x"],
   "5-15":       ["start_x", "split_x_5", "finish_x"],
-  "5-0-5":      ["left_x", "center_x", "right_x"],
+  "5-10-5":     ["left_x", "center_x", "right_x"],
+  // 5-0-5: line_x = zamanlama (start/finish) cizgisi, turn_x = 5 m otedeki
+  // donus cizgisi. Sporcu ucan baslangicla line_x'ten girer.
+  "5-0-5":      ["line_x", "turn_x"],
+  // ADA: start_x = baslangic, finish_x = bitis cizgisi (ayni zamanda kalibrasyon).
+  // Arasi varsayilan 20 m; farkliysa `cal_distance_m=<m>` ile gir (Ek parametreler).
+  // Frenleme mesafesi finish_x gecisinden sonra hesaplanir.
+  "ada":        ["start_x", "finish_x"],
 };
 // Marker görsel renkleri (sırayla).
 const MARKER_COLORS = ["#ef4444", "#f59e0b", "#10b981", "#3b82f6", "#a855f7"];
@@ -280,6 +311,29 @@ function redrawMarkerCanvas() {
   // Mevcut video frame'ini çiz, sonra çizgileri üstüne bindir.
   markerCtx.drawImage(vid, 0, 0, markerCanvas.width, markerCanvas.height);
   drawMarkerLines();
+}
+
+// YOLO çıkarımı sırasında canlı önizleme: o anki video karesi + tespit edilen
+// bbox + (varsa) kapı çizgileri. POSE NOKTASI çizilmez; analiz YOLO kutusuyla.
+// box koordinatları video native pikselindedir; markerCanvas da native çözünürlükte
+// (fitCanvasToVideo) → birebir hizalanır.
+function drawYoloPreview(box) {
+  if (!markerCtx) return;
+  markerCtx.drawImage(vid, 0, 0, markerCanvas.width, markerCanvas.height);
+  drawMarkerLines();
+  if (!box) return;
+  const w = box.x2 - box.x1, h = box.y2 - box.y1;
+  markerCtx.lineWidth = Math.max(2, markerCanvas.width / 320);
+  markerCtx.strokeStyle = "#22c55e";
+  markerCtx.strokeRect(box.x1, box.y1, w, h);
+  // hip_x (kutu merkezi) — analizin kullandığı yatay konum.
+  const cx = (box.x1 + box.x2) / 2;
+  markerCtx.setLineDash([6, 6]);
+  markerCtx.beginPath();
+  markerCtx.moveTo(cx, box.y1);
+  markerCtx.lineTo(cx, box.y2);
+  markerCtx.stroke();
+  markerCtx.setLineDash([]);
 }
 
 async function seek(v, t) {
@@ -412,17 +466,77 @@ async function makeLandmarker() {
   }
 }
 
+async function makeHandLandmarker() {
+  const { HandLandmarker, FilesetResolver } = await import(MPV);
+  if (!_vision) _vision = await FilesetResolver.forVisionTasks(MPV + "/wasm");
+  const conf = parseFloat(confEl.value) || 0.3;
+  const opts = {
+    baseOptions: { modelAssetPath: HAND_MODEL_URL, delegate: "GPU" },
+    runningMode: "VIDEO", numHands: 2,
+    minHandDetectionConfidence: conf,
+    minHandPresenceConfidence: conf,
+    minTrackingConfidence: conf,
+  };
+  try {
+    return await HandLandmarker.createFromOptions(_vision, opts);
+  } catch (e) {
+    opts.baseOptions.delegate = "CPU";
+    return await HandLandmarker.createFromOptions(_vision, opts);
+  }
+}
+
+// Tespit edilen elleri govde tarafina (sol/sag) en yakin bilek mesafesine
+// gore ata (backend src/pose_common._assign_hands_to_sides ile ayni mantik).
+// handedness etiketi ayna gorunumunde guvenilmez; bilek (landmark 0) mesafesi
+// kullanilir. Donus: { lh: [21 pt]|null, rh: [21 pt]|null }.
+function assignHands(handRes, poseLm) {
+  if (!handRes || !handRes.landmarks || !handRes.landmarks.length || !poseLm)
+    return { lh: null, rh: null };
+  const lw = poseLm[15], rw = poseLm[16];     // LEFT_WRIST, RIGHT_WRIST
+  if (!lw || !rw) return { lh: null, rh: null };
+  const best = { left: { pts: null, d: 1e9 }, right: { pts: null, d: 1e9 } };
+  for (const hand of handRes.landmarks) {
+    if (!hand || !hand.length) continue;
+    const h0 = hand[0];
+    const dl = (h0.x - lw.x) ** 2 + (h0.y - lw.y) ** 2;
+    const dr = (h0.x - rw.x) ** 2 + (h0.y - rw.y) ** 2;
+    const side = dl <= dr ? "left" : "right";
+    const d = Math.min(dl, dr);
+    if (d < best[side].d) best[side] = { pts: hand, d };
+  }
+  return { lh: best.left.pts, rh: best.right.pts };
+}
+
 // ── CSV ───────────────────────────────────────────────────────────────────
-function header() {
+function header(withHands) {
   const c = ["frame", "time_s", "width", "height", "fps"];
   for (let i = 0; i < N_PTS; i++) c.push(`x${i}`, `y${i}`, `z${i}`, `v${i}`);
   for (let i = 0; i < N_PTS; i++) c.push(`wx${i}`, `wy${i}`, `wz${i}`);
+  if (withHands) {
+    for (let i = 0; i < N_HAND; i++) c.push(`lhx${i}`, `lhy${i}`, `lhv${i}`);
+    for (let i = 0; i < N_HAND; i++) c.push(`rhx${i}`, `rhy${i}`, `rhv${i}`);
+  }
   return c.join(",");
 }
-function row(frame, t, W, H, fps, res) {
+function _handCells(hand) {
+  // 21 noktayi x,y,v (visibility=1) olarak yaz; el yoksa hucreler bos.
+  if (!hand) return Array(N_HAND * 3).fill("");
+  const out = [];
+  for (let i = 0; i < N_HAND; i++) {
+    const p = hand[i];
+    if (p) out.push(p.x.toFixed(8), p.y.toFixed(8), "1.000000");
+    else out.push("", "", "");
+  }
+  return out;
+}
+function row(frame, t, W, H, fps, res, hands, withHands) {
   const meta = [frame, t.toFixed(5), W, H, fps.toFixed(5)];
   const lm = res.landmarks && res.landmarks[0];
-  if (!lm) return meta.concat(Array(N_PTS * 4 + N_PTS * 3).fill("")).join(",");
+  if (!lm) {
+    let n = N_PTS * 4 + N_PTS * 3;
+    if (withHands) n += N_HAND * 3 * 2;        // pose yok -> el de yazilmaz
+    return meta.concat(Array(n).fill("")).join(",");
+  }
   const wm = res.worldLandmarks && res.worldLandmarks[0];
   const out = meta.slice();
   for (let i = 0; i < N_PTS; i++) {
@@ -435,19 +549,163 @@ function row(frame, t, W, H, fps, res) {
     if (p) out.push(p.x.toFixed(8), p.y.toFixed(8), p.z.toFixed(8));
     else out.push("0", "0", "0");
   }
+  if (withHands) {
+    out.push(..._handCells(hands ? hands.lh : null));
+    out.push(..._handCells(hands ? hands.rh : null));
+  }
   return out.join(",");
 }
 
-async function extract(v, lmk, fps) {
+// ── YOLO yolu (sprint/çeviklik) ─────────────────────────────────────────────
+// Tüm ağır iş (preprocess → ONNX inference → NMS → takip) Worker'da; ana thread
+// sadece kareyi seek edip ImageBitmap'i transfer eder ve progress günceller →
+// mobilde UI donmaz. Aynı anda yalnızca tek kare işlenir (bellek birikmez).
+function yoloWorkerSource() {
+  return `
+  let session = null, ort = null, IMGSZ = 416, prev = null, canvas = null, ctx = null;
+  function ensureCanvas(){ if(!canvas){ canvas = new OffscreenCanvas(IMGSZ,IMGSZ); ctx = canvas.getContext("2d",{willReadFrequently:true}); } }
+  function iou(a,b){ const x1=Math.max(a.x1,b.x1),y1=Math.max(a.y1,b.y1),x2=Math.min(a.x2,b.x2),y2=Math.min(a.y2,b.y2);
+    const w=Math.max(0,x2-x1),h=Math.max(0,y2-y1),inter=w*h; const ua=(a.x2-a.x1)*(a.y2-a.y1)+(b.x2-b.x1)*(b.y2-b.y1)-inter; return ua>0?inter/ua:0; }
+  function nms(arr,thr){ arr.sort((p,q)=>q.s-p.s); const keep=[]; for(const c of arr){ let ok=true; for(const k of keep){ if(iou(c,k)>thr){ok=false;break;} } if(ok)keep.push(c);} return keep; }
+  async function infer(bitmap, W, H, conf){
+    ensureCanvas();
+    const scale = Math.min(IMGSZ/W, IMGSZ/H);
+    const nw = Math.round(W*scale), nh = Math.round(H*scale);
+    const padX = Math.floor((IMGSZ-nw)/2), padY = Math.floor((IMGSZ-nh)/2);
+    ctx.clearRect(0,0,IMGSZ,IMGSZ);
+    ctx.drawImage(bitmap, 0,0,W,H, padX,padY,nw,nh);
+    const img = ctx.getImageData(0,0,IMGSZ,IMGSZ).data;
+    const n = IMGSZ*IMGSZ, input = new Float32Array(3*n);
+    for(let i=0;i<n;i++){ input[i]=img[i*4]/255; input[n+i]=img[i*4+1]/255; input[2*n+i]=img[i*4+2]/255; }
+    const t = new ort.Tensor("float32", input, [1,3,IMGSZ,IMGSZ]);
+    const feeds = {}; feeds[session.inputNames[0]] = t;
+    const out = await session.run(feeds);
+    const o = out[session.outputNames[0]], data = o.data, dims = o.dims; // [1,84,A]
+    const A = dims[2];
+    const cands = [];
+    for(let j=0;j<A;j++){
+      const s = data[4*A + j];           // class 0 (person) skoru
+      if(s < conf) continue;
+      const cx=data[j], cy=data[A+j], bw=data[2*A+j], bh=data[3*A+j];
+      const x1=(cx-bw/2-padX)/scale, y1=(cy-bh/2-padY)/scale, x2=(cx+bw/2-padX)/scale, y2=(cy+bh/2-padY)/scale;
+      cands.push({x1,y1,x2,y2,s});
+    }
+    const keep = nms(cands, 0.45);
+    if(!keep.length) return null;
+    let best = keep[0];
+    if(prev){ // süreklilik: önceki merkeze yakın + büyük kutu
+      const pcx=(prev.x1+prev.x2)/2, pcy=(prev.y1+prev.y2)/2; let bs=-1;
+      for(const b of keep){ const area=Math.max(0,b.x2-b.x1)*Math.max(0,b.y2-b.y1); const d=Math.hypot((b.x1+b.x2)/2-pcx,(b.y1+b.y2)/2-pcy); const sc=area/(1+d); if(sc>bs){bs=sc;best=b;} }
+    } else { let ba=-1; for(const b of keep){ const area=Math.max(0,b.x2-b.x1)*Math.max(0,b.y2-b.y1); if(area>ba){ba=area;best=b;} } }
+    prev = best;
+    return { x1:Math.max(0,Math.min(W,best.x1)), y1:Math.max(0,Math.min(H,best.y1)), x2:Math.max(0,Math.min(W,best.x2)), y2:Math.max(0,Math.min(H,best.y2)) };
+  }
+  self.onmessage = async (e) => {
+    const m = e.data;
+    try {
+      if(m.type==="init"){
+        IMGSZ = m.imgsz;
+        importScripts(m.ortCdn + "ort.webgpu.min.js");
+        ort = self.ort; ort.env.wasm.wasmPaths = m.ortCdn;
+        try { session = await ort.InferenceSession.create(m.modelUrl, { executionProviders:["webgpu","wasm"] }); }
+        catch(err){ session = await ort.InferenceSession.create(m.modelUrl, { executionProviders:["wasm"] }); }
+        prev = null; self.postMessage({type:"ready"}); return;
+      }
+      if(m.type==="frame"){ const box = await infer(m.bitmap, m.w, m.h, m.conf); m.bitmap.close(); self.postMessage({type:"box", index:m.index, box}); return; }
+    } catch(err){ self.postMessage({type:"error", message:String(err && err.message || err)}); }
+  };
+  `;
+}
+
+function makeYoloWorker() {
+  return new Promise((resolve, reject) => {
+    const blob = new Blob([yoloWorkerSource()], { type: "text/javascript" });
+    const w = new Worker(URL.createObjectURL(blob));
+    const onmsg = (e) => {
+      if (e.data.type === "ready") { w.removeEventListener("message", onmsg); resolve(w); }
+      else if (e.data.type === "error") { w.removeEventListener("message", onmsg); w.terminate(); reject(new Error(e.data.message)); }
+    };
+    w.addEventListener("message", onmsg);
+    w.onerror = (ev) => reject(new Error(ev.message || "YOLO worker hatası"));
+    w.postMessage({ type: "init", modelUrl: YOLO_MODEL_URL, imgsz: YOLO_IMGSZ, ortCdn: ORT_CDN });
+  });
+}
+
+// Kutudan SENTETİK 33-landmark CSV satırı (el yok). box null -> "pose yok".
+// hip_x = kutu merkezi (x23=x24=cx); dikey dağılım kutu üst/orta/alt'a göre.
+function rowFromBox(frame, t, W, H, fps, box) {
+  const meta = [frame, t.toFixed(5), W, H, fps.toFixed(5)];
+  if (!box) {
+    return meta.concat(Array(N_PTS * 4 + N_PTS * 3).fill("")).join(",");
+  }
+  const cx = ((box.x1 + box.x2) / 2) / W;
+  const top = box.y1 / H, bot = box.y2 / H, h = bot - top, cy = (top + bot) / 2;
+  const yOf = (i) =>
+    i === 0 ? top
+    : (i === 11 || i === 12) ? top + 0.15 * h
+    : (i === 23 || i === 24) ? top + 0.55 * h
+    : (i === 25 || i === 26) ? top + 0.78 * h
+    : (i === 27 || i === 28) ? bot
+    : cy;
+  const out = meta.slice();
+  for (let i = 0; i < N_PTS; i++) out.push(cx.toFixed(8), yOf(i).toFixed(8), "0", "1.000000");
+  for (let i = 0; i < N_PTS; i++) out.push("0", "0", "0");   // world landmark'lar
+  return out.join(",");
+}
+
+async function extractYolo(v, fps) {
   const W = v.videoWidth, H = v.videoHeight, dur = v.duration;
   const N = Math.max(1, Math.floor(dur * fps));
-  const lines = [header()];
+  const conf = parseFloat(confEl.value) || 0.3;
+  const worker = await makeYoloWorker();
+  const lines = [header(false)];
+  barEl.hidden = false; barEl.max = N;
+  try {
+    for (let i = 0; i < N; i++) {
+      const t = Math.min(i / fps, Math.max(0, dur - 1e-3));
+      await seek(v, t);
+      const bitmap = await createImageBitmap(v);
+      const box = await new Promise((resolve, reject) => {
+        const onmsg = (e) => {
+          if (e.data.type === "box" && e.data.index === i) { worker.removeEventListener("message", onmsg); resolve(e.data.box); }
+          else if (e.data.type === "error") { worker.removeEventListener("message", onmsg); reject(new Error(e.data.message)); }
+        };
+        worker.addEventListener("message", onmsg);
+        worker.postMessage({ type: "frame", bitmap, w: W, h: H, index: i, conf }, [bitmap]);
+      });
+      lines.push(rowFromBox(i, i / fps, W, H, fps, box));
+      // Canlı önizleme: o anki kareyi + tespit edilen bbox'ı markerCanvas'a çiz
+      // (pose noktası DEĞİL — analiz YOLO kutusuyla yapılıyor). Kapı çizgileri de korunur.
+      drawYoloPreview(box);
+      if (i % 3 === 0 || i === N - 1) {
+        barEl.value = i + 1;
+        setStatus(`YOLO işleniyor… ${i + 1}/${N}`);
+        await new Promise((r) => requestAnimationFrame(r));   // UI nefes alsın
+      }
+    }
+  } finally {
+    worker.terminate();
+  }
+  return lines.join("\n");
+}
+
+async function extract(v, lmk, hlmk, fps) {
+  const W = v.videoWidth, H = v.videoHeight, dur = v.duration;
+  const N = Math.max(1, Math.floor(dur * fps));
+  const withHands = !!hlmk;
+  const lines = [header(withHands)];
   barEl.hidden = false; barEl.max = N;
   for (let i = 0; i < N; i++) {
     const t = Math.min(i / fps, Math.max(0, dur - 1e-3));
     await seek(v, t);
-    const res = lmk.detectForVideo(v, Math.round((i * 1000) / fps));
-    lines.push(row(i, i / fps, W, H, fps, res));
+    const ts = Math.round((i * 1000) / fps);
+    const res = lmk.detectForVideo(v, ts);
+    let hands = null;
+    if (hlmk) {
+      const hres = hlmk.detectForVideo(v, ts);
+      hands = assignHands(hres, res.landmarks && res.landmarks[0]);
+    }
+    lines.push(row(i, i / fps, W, H, fps, res, hands, withHands));
     if (i % 4 === 0 || i === N - 1) {
       barEl.value = i + 1;
       setStatus(`Pose çıkarılıyor… ${i + 1}/${N}`);
@@ -460,7 +718,14 @@ async function extract(v, lmk, fps) {
 // ── Gönderim ──────────────────────────────────────────────────────────────
 async function send(testId, csv) {
   const fd = new FormData();
-  fd.append("csv", new Blob([csv], { type: "text/csv" }), "pose.csv");
+  // Uzun videolarda CSV 40+ MB olur (Cloud Run HTTP/1 limiti 32 MiB);
+  // gzip ~3x kucultur. Backend gzip'i icerikten (1f 8b) tanir.
+  let blob = new Blob([csv], { type: "text/csv" });
+  if (typeof CompressionStream !== "undefined") {
+    blob = await new Response(
+      blob.stream().pipeThrough(new CompressionStream("gzip"))).blob();
+  }
+  fd.append("csv", blob, "pose.csv");
   const h = heightEl.value.trim();
   if (h) fd.append("height_m", h);
   // Pixel marker'lar (varsa)
@@ -495,17 +760,27 @@ async function run() {
     }
   }
   runBtn.disabled = true; dlBtn.disabled = true;
-  let lmk = null;
+  let lmk = null, hlmk = null;
   try {
-    setStatus("Model yükleniyor…");
-    lmk = await makeLandmarker();
+    // Video + FPS (her iki yol için ortak).
     setStatus("Video yükleniyor…");
     // Video zaten fileEl.onchange ile yüklü; metadata garantilemek için tekrar bekle.
     if (!vid.duration) await loadVideo(file);
     let fps = parseFloat(fpsEl.value);
     if (!fps || fps <= 0) { setStatus("FPS ölçülüyor…"); fps = (await measureFps(vid)) || 30; }
     fpsEl.value = fps.toFixed(2);
-    lastCsv = await extract(vid, lmk, fps);
+
+    if (isYolo()) {
+      // Sprint/çeviklik: tarayıcı-içi YOLO (Worker). MediaPipe yüklenmez.
+      setStatus("YOLO modeli yükleniyor…");
+      lastCsv = await extractYolo(vid, fps);
+    } else {
+      // Pose-bağımlı testler: MediaPipe yolu (değişmedi).
+      setStatus("Model yükleniyor…");
+      lmk = await makeLandmarker();
+      if (needsHands()) { setStatus("El modeli yükleniyor…"); hlmk = await makeHandLandmarker(); }
+      lastCsv = await extract(vid, lmk, hlmk, fps);
+    }
     dlBtn.disabled = false;
     setStatus("CSV gönderiliyor…");
     await send(testSel.value, lastCsv);
@@ -515,6 +790,7 @@ async function run() {
     resultEl.classList.add("err");
   } finally {
     if (lmk && lmk.close) lmk.close();
+    if (hlmk && hlmk.close) hlmk.close();
     barEl.hidden = true; runBtn.disabled = false;
     // Marker preview'ı tekrar göster (extract pose seek'leriyle değişmişti).
     if (!markerUI.hidden && videoReadyForMarker) redrawMarkerCanvas();

@@ -1,8 +1,15 @@
+# Secrets — imaja ASLA girmez (.env her dizinde)
+.env
+*.env
+
 # Git / dokumantasyon
 .git
 .gitignore
 README.md
 DEPLOY.md
+
+# Deneysel Fugl-Meyer prototipi — imaja girmez (portu src/tests/fugl_meyer.py)
+fugl-mayer/
 
 # Docker'in kendisi
 Dockerfile
@@ -15,6 +22,10 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# Kaynak PDF — runtime'da gerekmez (soapie/data/chunks.json imaja dahildir,
+# indeks ondan derlenir). 13 MB; imaj disinda tutulur.
+documents/
 
 # Pose CSV / medya (imaja girmez)
 *.csv

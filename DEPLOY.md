@@ -23,7 +23,7 @@ gcloud run deploy fizyotr-backend \
   --cpu 1 \
   --memory 512Mi \
   --concurrency 8 \
-  --timeout 300
+  --timeout 900
 ```
 
 Bittiginde verdigi `https://fizyotr-backend-....run.app` adresine:
@@ -89,12 +89,15 @@ Endpoint'ler (kendi `https://fizyotr-soapie-....run.app` adresinde):
 | `--max-instances 4` | Maliyet/yuk tavani. Yuke gore artir. |
 | `--memory 512Mi` | numpy analizleri icin yeterli; cok uzun video CSV'lerinde `1Gi` yap. |
 | `--concurrency 8` | Bir instance'in es zamanli istek sayisi. Analiz CPU-yogun; dusuk tutmak daha akici. |
-| `--timeout 300` | Istek zaman asimi (sn). Analizler kisa; gerekirse artir. |
+| `--timeout 900` | Istek zaman asimi (sn). Analiz 10 dk'lik videoda bile birkac sn; sure asil **yuklemede** gider (yavas mobil baglanti). |
 | `--allow-unauthenticated` | API/arayuz herkese acik. Kapatmak istersen kaldir (IAM ile eris). |
 
-> **Not — istek boyutu:** Cloud Run HTTP/1'de istek govdesi ~32 MiB ile sinirli.
-> 60 sn'lik bir videonun pose CSV'si tipik olarak ~4 MB, sorun olmaz. Cok uzun
-> kayitlarda limit asilirsa Cloud Run'da HTTP/2 (`--use-http2`) acilabilir.
+> **Not — istek boyutu:** Cloud Run HTTP/1'de istek govdesi 32 MiB ile sinirli.
+> Pose CSV'si ~4.3 MB/dk (30 fps, el sutunlariyla daha fazla); 10 dk'lik video
+> ~43 MB eder ve limiti asar. Cozum: istemci CSV'yi gzip'leyip gondersin
+> (`CompressionStream("gzip")`, ~3x kuculur → 10 dk ≈ 15 MB). Backend gzip'i
+> icerikten tanir, alan adi/dosya adi degismez; duz CSV de kabul edilmeye devam eder.
+> (`--use-http2` burada ise yaramaz: gunicorn h2c konusmaz.)
 
 ## Soguk baslangic (cold start)
 

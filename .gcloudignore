@@ -1,0 +1,43 @@
+# Cloud Build'e YUKLENMEYECEK dosyalar (gcloud run deploy --source).
+# .gcloudignore varsa gcloud .gitignore'u OTOMATIK kullanmaz; bu yuzden
+# .gitignore desenleri burada da tekrarlanir.
+
+.git/
+.gitignore
+
+# Secrets — Cloud Build'e ASLA yuklenmez (.env her dizinde)
+.env
+*.env
+
+# Deneysel Fugl-Meyer prototipi — Flask app'ine dahil degil, deploy EDILMEZ
+# (~2.3 GB: venv + videos + output). Portlanmis surum src/tests/fugl_meyer.py.
+fugl-mayer/
+
+# Sanal ortamlar / Python ara ciktilari
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Kaynak PDF — runtime'da gerekmez (soapie/data/chunks.json deploy edilir,
+# indeks ondan derlenir). 13 MB; Cloud Build'e yuklenmez.
+documents/
+
+# Pose CSV / medya / modeller (sunucuda gerekmez)
+*.csv
+*.mp4
+*.mov
+*.MOV
+*.MP4
+*.task
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Ornek/test videolari ve ciktilari (sunucuda gerekmez)
+videos/
+*.avi

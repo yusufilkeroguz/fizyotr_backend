@@ -5,7 +5,8 @@ pose noktalarinin CSV'sini alir, ilgili analizcinin analyze() fonksiyonunu
 calistirir ve sonuc JSON doner. Sunucuda cv2/mediapipe/model GEREKMEZ
 (yalnizca flask + numpy).
 
-23 test (sebt haric) POST /analyze/<test_id> ile cagrilir.
+25 test POST /analyze/<test_id> ile cagrilir. sebt iki kameralidir
+(`csv` alaninda front.csv + side.csv); digerleri tek pose CSV'si alir.
 
 Calistirma:
     python app.py                      # http://localhost:8080  (arayuz: /app)
@@ -17,6 +18,7 @@ Ornek:
 """
 from __future__ import annotations
 
+import gzip
 import os
 import shutil
 import sys
@@ -56,7 +58,9 @@ from src.tests import (  # noqa: E402
     jump_height, less as less_mod,
     bosco_60, rsi_10_5, flamingo,
     functional_reach, ten_m_walk, rom,
-    sprint_30m, sprint_10_20_30, sprint_5_15, shuttle_5_0_5,
+    sprint_30m, sprint_10_20_30, sprint_5_15, shuttle_5_0_5, shuttle_5_10_5,
+    sebt, ada, fugl_meyer,
+    gait_lateral, gait_frontal,
 )
 
 
@@ -116,6 +120,7 @@ class Test:
     run: Callable[[str, Ctx], dict]
     extra_files: tuple = ()           # ek pose CSV alanlari (orn. less -> front)
     params: tuple = ()                # dokumantasyon icin
+    multi_csv: bool = False           # `csv` alaninda 1-2 dosya (sebt: front/side)
 
 
 TESTS: dict[str, Test] = {}
@@ -145,15 +150,40 @@ def _prod(mod):
 
 
 def _cmj(v, c):
+    # Yan (ana) kamera: sicrama yuksekligi (fizik + piksel).
     samples, fps = jump_height.extract_samples(v)
     px = jump_height.compute_pixel_height(samples, c.height)
     phys = jump_height.compute_physics_height(samples, fps)
-    return {
+    result = {
         "fps": round(fps, 2),
         "jump_height_cm": (round(phys["jump_m"] * 100, 1) if phys else None),
         "physics_method": phys,
         "pixel_method": px,
     }
+    # Ek ON kamera (opsiyonel): inis aninda diz valgus (FPPA) + sag-sol asimetri.
+    # LESS'in frontal kalemini yeniden kullaniyoruz (ayni protokol: inis IC'sinde
+    # hip-knee-ankle acisi). asimetri = |sol FPPA - sag FPPA|.
+    front = c.files.get("front")
+    if front:
+        fm = less_mod._frontal_metrics(front, c.model(), 0.3)
+        if fm:
+            ic = fm["ic"]
+            fl, fr = ic["fppa_l"], ic["fppa_r"]
+            fmin = min(fl, fr)
+            asym = abs(fl - fr)
+            result["frontal"] = {
+                "ic_frame": fm["ic_frame"],
+                "fppa_left_deg": round(fl, 1),
+                "fppa_right_deg": round(fr, 1),
+                "fppa_min_deg": round(fmin, 1),
+                "knee_valgus_error": bool(fmin < 170.0),
+                "valgus_asymmetry_deg": round(asym, 1),
+                # >8 deg sol-sag fark klinik olarak anlamli asimetri kabul edilir
+                "asymmetry_flag": bool(asym > 8.0),
+            }
+        else:
+            result["frontal"] = None  # on videoda inis/ucus tespit edilemedi
+    return result
 
 
 def _less(v, c):
@@ -186,6 +216,18 @@ def _10mwt(v, c):
     return ten_m_walk.analyze(v, distance_m=c.f("distance", 10.0),
                               start_x=c.i("start_x"), finish_x=c.i("finish_x"),
                               model=c.model())
+
+
+def _gait_lateral(v, c):
+    # Yan kamera: zaman-mesafe parametreleri (stride/step uzunluk, hiz, stance/swing).
+    return gait_lateral.analyze(v, height_m=c.height, model=c.model())
+
+
+def _gait_frontal(v, c):
+    # On kamera: step width, kadans, temporal simetri, diz valgus/varus, FPA.
+    return gait_frontal.analyze(v, height_m=c.height,
+                                shoulder_width_m=c.f("shoulder_width_m", 0.40),
+                                model=c.model())
 
 
 def _need_int(c: Ctx, name: str) -> int:
@@ -222,14 +264,52 @@ def _sprint_5_15(v, c):
     )
 
 
-def _shuttle_5_0_5(v, c):
-    return shuttle_5_0_5.analyze(
+def _shuttle_5_10_5(v, c):
+    return shuttle_5_10_5.analyze(
         v,
         left_x=_need_int(c, "left_x"),
         center_x=_need_int(c, "center_x"),
         right_x=_need_int(c, "right_x"),
         model=c.model(),
     )
+
+
+def _shuttle_5_0_5(v, c):
+    return shuttle_5_0_5.analyze(
+        v,
+        line_x=_need_int(c, "line_x"),
+        turn_x=_need_int(c, "turn_x"),
+        model=c.model(),
+    )
+
+
+def _ada(v, c):
+    return ada.analyze(v, start_x=c.i("start_x"), finish_x=c.i("finish_x"),
+                       cal_distance_m=c.f("cal_distance_m", 20.0),
+                       height_m=c.height, model=c.model())
+
+
+def _sebt(v, c):
+    # SEBT: standart tek pose CSV'si yerine front/side dosyalari (multi_csv).
+    # 'v' kullanilmaz; dosyalar c.files['front'] / c.files['side'].
+    return sebt.analyze(
+        front_path=c.files.get("front"),
+        side_path=c.files.get("side"),
+        height_m=_need_height(c),
+        directions=c.s("directions"),
+        legs=c.s("legs"),
+        limb_length_cm=c.f("limb_length_cm"),
+    )
+
+
+def _fugl(test_id: str):
+    """Fugl-Meyer test adaptoru. test_id sabit (rota basina bir test);
+    side=auto/left/right, model, ve FM-D icin opsiyonel 'unaffected' CSV."""
+    def run(v, c):
+        return fugl_meyer.analyze(
+            v, test=test_id, side=c.s("side", "auto"),
+            model=c.model(), unaffected=c.files.get("unaffected"))
+    return run
 
 
 # ── Kayitlar ─────────────────────────────────────────────────────────────
@@ -253,15 +333,22 @@ _reg(Test("squat-jump", _LOWER, _prod(prod_squat_jump), params=(_H,)))
 _reg(Test("broad-jump", _LOWER, _prod(prod_broad_jump), params=(_H,)))
 _reg(Test("single-leg-cmj", _LOWER, _prod(prod_single_leg_jump), params=(_H,)))
 _reg(Test("single-leg-hop", _LOWER, _prod(prod_single_leg_hop), params=(_H,)))
-_reg(Test("cmj", _LOWER, _cmj, params=("height_m(ops, cm icin)",)))
+_reg(Test("cmj", _LOWER, _cmj, extra_files=("front",),
+          params=("height_m(ops, cm icin)", "front(ON kamera pose CSV, ops: valgus+asimetri)")))
 _reg(Test("less", _LOWER, _less, extra_files=("front",), params=("front(pose CSV, ops)",)))
 _reg(Test("bosco-60", _LOWER, _bosco, params=("duration(=60)",)))
 _reg(Test("rsi-10-5", _LOWER, _rsi, params=("best(=5)",)))
 
 _reg(Test("flamingo", _BAL, _flamingo, params=("duration(=60)", "height_m(ops)")))
 _reg(Test("functional-reach", _BAL, _frt, params=("height_m(ops)",)))
+_reg(Test("sebt", _BAL, _sebt, multi_csv=True,
+          params=(_H, "directions*", "legs*", "limb_length_cm(ops)",
+                  "csv=front.csv/side.csv (1-2 dosya)")))
 
 _reg(Test("10mwt", _GAIT, _10mwt, params=("distance(=10)", "start_x(ops)", "finish_x(ops)")))
+_reg(Test("gait-lateral", _GAIT, _gait_lateral, params=("height_m(ops — uzunluk/hiz icin)",)))
+_reg(Test("gait-frontal", _GAIT, _gait_frontal,
+          params=("height_m(ops)", "shoulder_width_m(=0.40, boy yoksa olcek)")))
 
 _reg(Test("30m", _SPRINT, _sprint_30m,
           params=("start_x(ops)", "finish_x(ops)", "distance(=30)")))
@@ -269,28 +356,56 @@ _reg(Test("10-20-30m", _SPRINT, _sprint_10_20_30,
           params=("start_x*", "split_x_10*", "split_x_20*", "finish_x*")))
 _reg(Test("5-15", _SPRINT, _sprint_5_15,
           params=("start_x*", "split_x_5*", "finish_x*")))
-_reg(Test("5-0-5", _SPRINT, _shuttle_5_0_5,
+_reg(Test("5-10-5", _SPRINT, _shuttle_5_10_5,
           params=("left_x*", "center_x*", "right_x*")))
+_reg(Test("5-0-5", _SPRINT, _shuttle_5_0_5,
+          params=("line_x*", "turn_x*")))
+_reg(Test("ada", _SPRINT, _ada,
+          params=("start_x(ops)", "finish_x(ops)", "cal_distance_m(=20)",
+                  "height_m(ops)")))
 
 _reg(Test("rom", _ROM, _rom, params=("joint(=knee: knee/hip/elbow/shoulder/ankle/trunk)", "side(=auto)")))
+
+# ── Fugl-Meyer Ust Ekstremite (FMA-UE) ───────────────────────────────────
+# Pose CSV'si el landmark'lari da icermeli (lhx*/rhx* sutunlari); aksi halde
+# onkol rotasyon / bilek / FM-D alt-skorlari olculemez. side=auto/left/right.
+_FUGL = "Fugl-Meyer (FMA-UE)"
+_FP = ("side(=auto: left/right)",)
+_reg(Test("fugl-flexor", _FUGL, _fugl("flexor"), params=_FP))
+_reg(Test("fugl-extensor", _FUGL, _fugl("extensor"), params=_FP))
+_reg(Test("fugl-synergy", _FUGL, _fugl("all"), params=_FP))   # Bolum II ozeti
+_reg(Test("fugl-fm6", _FUGL, _fugl("FM-6"), params=_FP))
+_reg(Test("fugl-fm7", _FUGL, _fugl("FM-7"), params=_FP))
+_reg(Test("fugl-fm8", _FUGL, _fugl("FM-8"), params=_FP))
+_reg(Test("fugl-fm9", _FUGL, _fugl("FM-9"), params=_FP))
+_reg(Test("fugl-fm10", _FUGL, _fugl("FM-10"), params=_FP))
+_reg(Test("fugl-fm11", _FUGL, _fugl("FM-11"), params=_FP))
+_reg(Test("fugl-fm12", _FUGL, _fugl("FM-12"), params=_FP))
+_reg(Test("fugl-fm13", _FUGL, _fugl("FM-13"), params=_FP))
+_reg(Test("fugl-fmd", _FUGL, _fugl("FM-D"), extra_files=("unaffected",),
+          params=("side(=auto)", "unaffected(pose CSV, ops — paired skorlama)")))
 
 
 # ── Supabase JWT dogrulamasi ─────────────────────────────────────────────
 # Frontend Supabase'den aldigi JWT'yi `Authorization: Bearer <token>` ile yollar.
 # Backend JWKS uzerinden public key'le dogrular — secret dagitmaya gerek yok.
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+#
+# Coklu proje: SUPABASE_URL virgulle ayrilmis liste olabilir (orn.
+# "https://aaa.supabase.co,https://bbb.supabase.co"). Token'in 'iss' claim'ine
+# gore dogru proje secilir; sadece listedeki issuer'lara guvenilir.
+SUPABASE_URLS = [u.strip().rstrip("/") for u in
+                 os.environ.get("SUPABASE_URL", "").split(",") if u.strip()]
 SUPABASE_JWT_AUD = os.environ.get("SUPABASE_JWT_AUD", "authenticated")
-_jwks_client: PyJWKClient | None = None
+_jwks_clients: dict[str, PyJWKClient] = {}
 
 
-def _jwks() -> PyJWKClient:
-    """PyJWKClient kendi icinde key'leri cache'ler (default 5 dk)."""
-    global _jwks_client
-    if _jwks_client is None:
-        if not SUPABASE_URL:
-            raise RuntimeError("SUPABASE_URL env var tanimlanmamis")
-        _jwks_client = PyJWKClient(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")
-    return _jwks_client
+def _jwks_for(base_url: str) -> PyJWKClient:
+    """base_url projesi icin PyJWKClient (her client key'leri ~5 dk cache'ler)."""
+    c = _jwks_clients.get(base_url)
+    if c is None:
+        c = PyJWKClient(f"{base_url}/auth/v1/.well-known/jwks.json")
+        _jwks_clients[base_url] = c
+    return c
 
 
 def require_auth(fn):
@@ -309,13 +424,21 @@ def require_auth(fn):
         if not auth.startswith("Bearer "):
             return jsonify({"error": "missing bearer token"}), 401
         token = auth[len("Bearer "):].strip()
+        if not SUPABASE_URLS:
+            return jsonify({"error": "SUPABASE_URL env var tanimlanmamis"}), 500
         try:
-            key = _jwks().get_signing_key_from_jwt(token).key
+            # Token'in 'iss'ine bak (imza HENUZ dogrulanmadi), sadece guvenilen
+            # projelerden biriyle eslesirse o projenin JWKS'iyle dogrula.
+            iss = jwt.decode(token, options={"verify_signature": False}).get("iss", "")
+            base = next((u for u in SUPABASE_URLS if f"{u}/auth/v1" == iss), None)
+            if base is None:
+                return jsonify({"error": f"untrusted issuer: {iss}"}), 401
+            key = _jwks_for(base).get_signing_key_from_jwt(token).key
             g.user = jwt.decode(
                 token, key,
                 algorithms=["RS256", "ES256"],
                 audience=SUPABASE_JWT_AUD,
-                issuer=f"{SUPABASE_URL}/auth/v1",
+                issuer=f"{base}/auth/v1",
             )
         except Exception as e:
             return jsonify({"error": f"invalid token: {type(e).__name__}: {e}"}), 401
@@ -364,6 +487,23 @@ def index():
     })
 
 
+def _save_upload(f, path: Path) -> None:
+    """Yuklenen CSV'yi diske yaz; gzip'liyse (1f 8b magic) akista ac.
+
+    Uzun videolarin pose CSV'si 40+ MB'a cikip Cloud Run'in HTTP/1 istek
+    limitine (32 MiB) / yukleme suresine takilir. Istemci CSV'yi gzip'leyip
+    (CompressionStream("gzip")) gonderebilir: ~2.5-3x kuculur. Dosya adi
+    veya Content-Encoding'e degil icerige bakilir; duz CSV aynen kaydedilir.
+    """
+    head = f.stream.read(2)
+    f.stream.seek(0)
+    if head == b"\x1f\x8b":
+        with gzip.GzipFile(fileobj=f.stream) as src, open(path, "wb") as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+    else:
+        f.save(str(path))
+
+
 @app.post("/analyze/<test_id>")
 @require_auth
 def analyze(test_id):
@@ -375,19 +515,38 @@ def analyze(test_id):
     tmp = Path(tempfile.mkdtemp(prefix="sport_"))
     try:
         ctx_files: dict[str, str] = {}
-        up_csv = request.files.get("csv")          # tarayicida cikarilmis pose CSV
-        if up_csv is None:
-            return jsonify({"error": "'csv' dosyasi gerekli (multipart/form-data). "
-                                     "Pose CSV'sini GET /app arayuzu uretir."}), 400
-        cpath = tmp / "pose.csv"
-        up_csv.save(str(cpath))
-        target = str(cpath)
-        for ef in t.extra_files:                   # ek pose CSV (orn. less 'front')
-            f = request.files.get(ef)
-            if f is not None:
-                p = tmp / f"{secure_filename(ef)}.csv"
-                f.save(str(p))
-                ctx_files[ef] = str(p)
+        if t.multi_csv:
+            # 'csv' alaninda 1-2 dosya gelir; filename'e gore front/side ayrilir
+            # (sebt). Standart tek-CSV akisi (target=pose.csv) gecerli degil.
+            uploads = request.files.getlist("csv")
+            for f in uploads:
+                if f is None or not f.filename:
+                    continue
+                stem = secure_filename(f.filename).lower()
+                key = "front" if "front" in stem else "side" if "side" in stem else None
+                if key is None or key in ctx_files:
+                    continue
+                p = tmp / f"{key}.csv"
+                _save_upload(f, p)
+                ctx_files[key] = str(p)
+            if not ctx_files:
+                return jsonify({"error": "'csv' dosyasi gerekli: front.csv ve/veya "
+                                         "side.csv (multipart/form-data)."}), 400
+            target = None
+        else:
+            up_csv = request.files.get("csv")      # tarayicida cikarilmis pose CSV
+            if up_csv is None:
+                return jsonify({"error": "'csv' dosyasi gerekli (multipart/form-data). "
+                                         "Pose CSV'sini GET /app arayuzu uretir."}), 400
+            cpath = tmp / "pose.csv"
+            _save_upload(up_csv, cpath)
+            target = str(cpath)
+            for ef in t.extra_files:               # ek pose CSV (orn. less 'front')
+                f = request.files.get(ef)
+                if f is not None:
+                    p = tmp / f"{secure_filename(ef)}.csv"
+                    _save_upload(f, p)
+                    ctx_files[ef] = str(p)
 
         ctx = Ctx(request.form, ctx_files)
         result = t.run(target, ctx)
